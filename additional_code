@@ -1,0 +1,1680 @@
+Can you take a look at the Python code and advise:
+
+# Economic Analysis Expanded Syphilis Prenatal Screening and Treatment
+
+
+```python
+import warnings
+from typing import Optional, Tuple, Dict
+from scipy.stats import beta, lognorm, triang, gamma, invgamma, norm, uniform, weibull_min, dirichlet
+import numpy as np
+import pandas as pd
+
+import matplotlib.pyplot as plt
+from matplotlib.patches import Ellipse
+import matplotlib.transforms as transforms
+from matplotlib.ticker import StrMethodFormatter
+import matplotlib.ticker as ticker 
+from dataclasses import dataclass
+```
+
+
+```python
+# Global parameters
+life_expectancy = 78
+discount_rate = .035
+n_iter = 10_000
+seed = 2025
+```
+
+
+```python
+# Dollar formatter function for graphs
+def dollar_formatter(x, pos):
+    return f"${x:,.0f}"
+```
+
+
+```python
+# Million dollar formatter function
+def millions_formatter(x, pos):
+    return f'${x*1e-6:,.0f}M'
+```
+
+
+```python
+# Create a function for drawing a 95% CI ellipse around simulated values
+# This function has been lifted from the Matplotlib website
+def ci_ellipse(x, y, edgecolor="k"):
+    """
+    Draws a 95% confidence ellipse on the current matplotlib plot based on the
+    given x and y data.
+    Source: Matplotlib website
+    Args:
+        x (array-like): The x-coordinate data.
+        y (array-like): The y-coordinate data.
+
+    Returns:
+        matplotlib.patches.Ellipse: The Ellipse object representing the 95% confidence ellipse.
+    """
+    # Calculate the mean and covariance matrix
+    mean = np.array([np.mean(x), np.mean(y)])
+    cov = np.cov(x, y)
+
+    # Calculate the eigenvalues and eigenvectors of the covariance matrix
+    eigenvalues, eigenvectors = np.linalg.eig(cov)
+
+    # Calculate the angle of rotation of the ellipse
+    angle = np.arctan2(eigenvectors[1, 0], eigenvectors[0, 0])
+
+    # Calculate the width and height of the ellipse
+    width = 2 * np.sqrt(eigenvalues[0]) * np.sqrt(5.991)  # 95% confidence level
+    height = 2 * np.sqrt(eigenvalues[1]) * np.sqrt(5.991)  # 95% confidence level
+
+    # Create and add the ellipse to the plot
+    ellipse = Ellipse(xy=mean, width=width, height=height,
+                      angle=np.rad2deg(angle), edgecolor=edgecolor, fc='None', lw=1)
+    plt.gca().add_patch(ellipse)
+
+    return ellipse
+```
+
+
+```python
+# Useful functions
+def std_2(lower_ci, upper_ci):
+    """
+    Estimate standard deviation if there is no sample size
+    """
+    return (upper_ci - lower_ci) / 4.0
+```
+
+
+```python
+def disc_daly(daly:float,
+              daly_range: tuple,
+             life_expectancy: int = life_expectancy,
+             discount_rate: float = discount_rate):
+    disc_daly = daly * (1 - (1 + discount_rate) ** (-life_expectancy))/discount_rate
+    disc_daly_std = std_2(daly_range[0], daly_range[1]) * (1 - (1 + discount_rate) ** (-life_expectancy))/discount_rate
+    return disc_daly, disc_daly_std
+```
+
+
+```python
+def lognorm_params_from_bounds(lower, upper):
+    """
+    Return mu and sigma for a lognormal dist. where lower/upper are p_low/p_high percentiles
+    """
+    z_low, z_high = -1.96, 1.96
+    sigma = (np.log(upper) - np.log(lower)) / 3.92
+    mu = (np.log(lower) + np.log(upper)) / 2.0
+    return mu, sigma
+```
+
+
+```python
+def sample_lognormal_from_bounds(lower, upper, size=1):
+    """Get shape and scale for lognorm using Scipy"""
+    lower = max(lower, 1e-6)
+    upper = max(upper, lower * 1.01)
+    mu, sigma = lognorm_params_from_bounds(lower, upper)
+    return lognorm(s=sigma, scale=np.exp(mu)).rvs(size=size)
+```
+
+
+```python
+def beta_params_from_bounds(mean, low, high):
+    sd_approx = (high - low) / 4.0
+    var = max(sd_approx ** 2, 1e-8)
+    denom = mean * (1 - mean)
+    if denom <= 0 or var <= 0:
+        return 1.0, 1.0
+    ab = max(denom / var - 1.0, 1e-3)
+    a = max(mean * ab, 1e-3)
+    b = max((1 - mean) * ab, 1e-3)
+    return a, b  
+```
+
+
+```python
+def pv_annuity(amount_per_year, years, rate=discount_rate):
+    if years <= 0:
+        return 0.0
+    return amount_per_year * ((1 - (1 + rate) **(-years)) / rate)
+```
+
+
+```python
+def simulate_disability_weights(mean, std, n_samples=n_iter, random_state=None):
+    """
+    Simulate disability weights from a Beta distribution with specified mean and sd
+    """
+    if not 0 < mean < 1:
+        raise ValueError("Mean must be between 0 and 1")
+    if std <= 0:
+        raise ValueError("Standard deviation must be positive")
+
+    variance = std ** 2
+
+    # Max std deviation for given mean
+    max_std = np.sqrt(mean * (1-mean))
+    if std > max_std:
+        raise ValueError(f"Standard deviation too large for mean={mean}. Maximum allowed: {max_std:.4f}")
+
+    # Calc Beta distribution parameters using method of moments
+    alpha = ((1 - mean) / variance - 1 /mean) * mean ** 2
+    beta_param = alpha * (1/mean - 1)
+
+    # Check validity
+    if alpha <= 0 or beta_param <=0:
+        raise ValueError(
+            f"Invalid parameters: mean={mean} and sd={std} combination"
+            f"results in non-positive Beta parameters (alpha={alpha:.4f}, beta={beta_param:.4f})"
+        )
+    if random_state is not None:
+        np.random.seed(random_state)
+    samples = beta.rvs(alpha, beta_param, size=n_samples)
+
+    return samples, alpha, beta_param
+```
+
+
+```python
+def pv_years(years, r):
+    if r == 0:
+        return years
+    return (1 - (1 + r) ** (-years)) / r
+```
+
+
+```python
+def calc_dalys_beta_both(
+    n_cases=1,
+    dw_mean=0.315, dw_low=0.159, dw_high=0.471,
+    duration_years=10,
+    prob_death=0.05,
+    life_expectancy_at_death=65,
+    discount_rate=discount_rate,
+    n_iter=n_iter,
+    seed=seed
+):
+    """
+    Monte Carlo estimation of DALYs per case and total, returning BOTH
+    discounted and undiscounted estimates. Disability weight sampled as Beta.
+
+    Returns: dict with: mean/95%UI per-case and total for:
+      - daly_undiscounted, daly_discounted, components yld/yll both ways
+    """
+    rs = np.random.RandomState(seed)
+
+    # Sample DW from Beta parameterized by bounds
+    a_dw, b_dw = beta_params_from_bounds(dw_mean, dw_low, dw_high)
+    dw_samples = beta(a_dw, b_dw).rvs(size=n_iter, random_state=rs)
+
+    # Sample death probability & duration (here simple uniform ±20%)
+    pdeath_samples = np.clip(rs.uniform(0.8 * prob_death, 1.2 * prob_death, size=n_iter), 0, 1)
+    dur_samples = rs.uniform(0.8 * duration_years, 1.2 * duration_years, size=n_iter)
+
+    # Precompute discounted year-factors
+    pv_dur = np.array([pv_years(t, discount_rate) for t in dur_samples])      # PV of duration
+    pv_life = pv_years(life_expectancy_at_death, discount_rate)               # PV of life exp (constant)
+
+    # YLD, undiscounted and discounted
+    yld_und = (1 - pdeath_samples) * dw_samples * dur_samples
+    yld_disc = (1 - pdeath_samples) * dw_samples * pv_dur
+
+    # YLL, undiscounted and discounted
+    yll_und = pdeath_samples * life_expectancy_at_death
+    yll_disc = pdeath_samples * pv_life
+
+    daly_per_case_und = yld_und + yll_und
+    daly_per_case_disc = yld_disc + yll_disc
+
+    # Totals
+    total_und = n_cases * daly_per_case_und
+    total_disc = n_cases * daly_per_case_disc
+
+    # Summaries
+    def summarize(arr):
+        return {
+            "mean": float(np.mean(arr)),
+            "median": float(np.median(arr)),
+            "2.5%": float(np.percentile(arr, 2.5)),
+            "97.5%": float(np.percentile(arr, 97.5))
+        }
+
+    out = {
+        "per_case": {
+            "DALY_undiscounted": summarize(daly_per_case_und),
+            "DALY_discounted": summarize(daly_per_case_disc),
+            "YLD_undiscounted": summarize(yld_und),
+            "YLD_discounted": summarize(yld_disc),
+            "YLL_undiscounted": summarize(yll_und),
+            "YLL_discounted": summarize(yll_disc),
+        },
+        "total": {
+            "DALY_undiscounted": summarize(total_und),
+            "DALY_discounted": summarize(total_disc)
+        },
+        # raw arrays if you want to investigate distributions downstream
+        "samples": {
+            "per_case_undiscounted": daly_per_case_und,
+            "per_case_discounted": daly_per_case_disc,
+            "yld_und": yld_und,
+            "yld_disc": yld_disc,
+            "yll_und": yll_und,
+            "yll_disc": yll_disc
+        }
+    }
+    return out
+```
+
+
+```python
+# US based cost inputs from Chesson and Peterman 2019
+# ---------- Appendix-based cost components (Use the exact table values) ----------
+cost_components = {
+    # cardiovascular
+    'aortic_valve_replacement': {'base': 46819, 'low': 12223, 'high': 104658},
+    'cv_followup_per_year': {'base': 974, 'low': 498, 'high': 1506},
+    'cv_followup_years': {'base': 22, 'low': 8, 'high': 41},  # sample years uniformly
+    
+    # meningovascular
+    'treatment_for_meningoencephalitis': {'base': 21660, 'low': 9913, 'high': 58635},
+    'treatment_for_stroke': {'base': 24444, 'low': 3823, 'high': 95381},
+    'meningo_longterm_care_per_year': {'base': 32435, 'low': 23763, 'high': 41107},
+    'meningo_longterm_years': {'base': 22, 'low': 8, 'high': 41},  # those requiring long-term care
+    
+    # general paresis
+    'general_paresis_initial': {'base': 32435, 'low': 23763, 'high': 41107},
+    'general_paresis_longterm_per_year': {'base': 32435, 'low': 23763, 'high': 41107},
+    'general_paresis_longterm_years': {'base': 8, 'low': 3, 'high': 11},
+    
+    # tabes dorsalis
+    'tabes_initial': {'base': 2409, 'low': 1443, 'high': 3375},
+    'tabes_followup_years': {'base': 22, 'low': 8, 'high': 41},
+    
+    # late benign: use calculated estimates
+    'late_benign_one_time': {'base': 2791, 'low': 2268, 'high': 3323},
+}
+```
+
+
+```python
+# ---------- probabilities of sequelae (conditional on congenital case) ----------
+# Use the base probabilities (Table 1 / Appendix).
+probabilities = {
+    # these are the conditional probs among those with late disease in Chesson,
+    'cardiovascular': (0.09, 0.05, 0.13),
+    'meningovascular': (0.03, 0.01, 0.05),
+    'general_paresis': (0.02, 0.01, 0.03),
+    'tabes_dorsalis': (0.02, 0.01, 0.03),
+    'late_benign': (0.16, 0.10, 0.22),
+}
+```
+
+
+```python
+# ---------- function to run Monte Carlo ----------
+def congenital_mc(n_iter=n_iter, discount_rate=discount_rate, seed=seed):
+    np.random.seed(seed)
+    samples = np.zeros(n_iter)
+    
+    # Precompute lognormal params for cost components where applicable
+    # Rreat unit cost items via lognormal matching lower/upper as 2.5%/97.5%ile.
+    def draw_unit_cost(key):
+        comp = cost_components[key]
+        return sample_lognormal_from_bounds(comp['low'], comp['high'], size=1)[0]
+ 
+    # precompute beta params for each sequela
+    prob_beta_params = {k: beta_params_from_bounds(*probabilities[k]) for k in probabilities}
+    
+    for i in range(n_iter):
+        # --- sample costs ---
+        # cardiovascular
+        aortic = draw_unit_cost('aortic_valve_replacement')
+        cv_follow_year_cost = draw_unit_cost('cv_followup_per_year')
+        cv_years = uniform.rvs(loc=cost_components['cv_followup_years']['low'],
+                               scale=(cost_components['cv_followup_years']['high'] - cost_components['cv_followup_years']['low']))
+        cv_follow_pv = pv_annuity(cv_follow_year_cost, cv_years, discount_rate)
+        cost_cardio = aortic + cv_follow_pv
+        
+        # meningovascular
+        meningoence = draw_unit_cost('treatment_for_meningoencephalitis')
+        stroke_cost = draw_unit_cost('treatment_for_stroke')
+        meningo_lt_cost_per_year = draw_unit_cost('meningo_longterm_care_per_year')
+        meningo_lt_years = uniform.rvs(loc=cost_components['meningo_longterm_years']['low'],
+                                       scale=(cost_components['meningo_longterm_years']['high'] - cost_components['meningo_longterm_years']['low']))
+        meningo_lt_pv = pv_annuity(meningo_lt_cost_per_year, meningo_lt_years, discount_rate)
+        # Chesson applied 75% stroke and 17% require long-term care among those with meningovascular (see Appendix)
+        # Mirror that structure here, sampling 0.75/0.17 uncertainty via beta if desired; for now use fixed mixture
+
+        cost_meningo = 0.75 * (stroke_cost + 0.17 * meningo_lt_pv) + 0.25 * meningoence
+        
+        # general paresis
+        gp_init = draw_unit_cost('general_paresis_initial')
+        gp_lt_per_year = draw_unit_cost('general_paresis_longterm_per_year')
+        gp_lt_years = uniform.rvs(loc=cost_components['general_paresis_longterm_years']['low'],
+                                  scale=(cost_components['general_paresis_longterm_years']['high'] - cost_components['general_paresis_longterm_years']['low']))
+        gp_lt_pv = pv_annuity(gp_lt_per_year, gp_lt_years, discount_rate)
+        cost_gp = gp_init + gp_lt_pv
+        
+        # tabes dorsalis
+        tabes_init = draw_unit_cost('tabes_initial')
+        tabes_years = uniform.rvs(loc=cost_components['tabes_followup_years']['low'],
+                                  scale=(cost_components['tabes_followup_years']['high'] - cost_components['tabes_followup_years']['low']))
+        tabes_pv = pv_annuity(draw_unit_cost('tabes_initial'), tabes_years, discount_rate)
+        cost_tabes = tabes_init + tabes_pv
+        
+        # late benign
+        late_benign_one = draw_unit_cost('late_benign_one_time')
+        cost_late_benign = late_benign_one
+        
+        # compose dictionary
+        sampled_costs = {
+            'cardiovascular': cost_cardio,
+            'meningovascular': cost_meningo,
+            'general_paresis': cost_gp,
+            'tabes_dorsalis': cost_tabes,
+            'late_benign': cost_late_benign
+        }
+        
+        # --- sample probabilities (conditional on congenital case) ---
+        sampled_probs = {k: beta(a=prob_beta_params[k][0], b=prob_beta_params[k][1]).rvs() for k in probabilities}
+        
+        total_p = sum(sampled_probs.values())
+        if total_p <= 0:
+            # fallback
+            weights = {k: probabilities[k][0] for k in probabilities}
+            total_p = sum(weights.values())
+            sampled_probs = {k: v/total_p for k, v in weights.items()}
+        else:
+            sampled_probs = {k: v/total_p for k, v in sampled_probs.items()}
+        
+        # compute expected cost per congenital case (no 0.033 multiplier)
+        expected_case_cost = sum(sampled_probs[k] * sampled_costs[k] for k in sampled_costs)
+        samples[i] = expected_case_cost
+    
+    # return distribution summary
+    mean = samples.mean()
+    p2_5, p97_5 = np.percentile(samples, [2.5, 97.5])
+    return {'mean': mean, '2.5%': p2_5, '97.5%': p97_5, 'samples': samples}
+```
+
+
+```python
+# Estimate lifetime costs of congenital syphilis from a healthcare perspective
+cs_costs = congenital_mc(n_iter = n_iter)
+#print(result["mean"], result["2.5%"], result["97.5%"])
+```
+
+
+```python
+cs_costs
+```
+
+
+
+
+    {'mean': np.float64(42767.71863826914),
+     '2.5%': np.float64(27087.9475513172),
+     '97.5%': np.float64(66247.51340491022),
+     'samples': array([31848.71482696, 50553.43852523, 34450.09299661, ...,
+            30941.29132959, 31866.19853379, 28190.19281246], shape=(10000,))}
+
+
+
+
+```python
+health_samples = cs_costs["samples"]
+np.mean(health_samples)
+```
+
+
+
+
+    np.float64(42767.71863826914)
+
+
+
+
+```python
+# Verify if the estimates are close to those in Chesson and Peterman
+42767.71863826914 * .033 / inflation_factor # .033 probability of syphilis in Chesson paper
+# We obtain $1193 which is close enough (Chesson had $1190)
+```
+
+
+
+
+    1193.1072958072778
+
+
+
+
+```python
+# ----------------- Core MC function -----------------
+def societal_weighted_mc(
+    n_iter=n_iter,
+    sequelae_probs=None,
+    sequelae_societal_costs=None,
+    health_samples=None,
+    discount_rate=discount_rate,
+    seed=seed,
+    sequelae_mutually_exclusive=False,
+    premature_mortality_method='human_capital',  # or 'VSL'
+    VSL_value=None
+):
+    """
+    Monte Carlo that weights societal cost components by sequela probabilities.
+
+    Parameters
+    ----------
+    n_iter : int
+    sequelae_probs : dict
+        keys = sequela names, values = (base_prob, low_prob, high_prob)
+    sequelae_societal_costs : dict
+        keys = sequela names, values = dict of societal cost elements. Example:
+        {
+          'cardiovascular': {
+              'caregiver_hours_per_year': (base, low, high),
+              'caregiver_wage': (base, low, high),
+              'care_years': (base, low, high),   # will be sampled uniformly between low and high
+              'lost_earnings_per_year': (base, low, high),
+              'lost_work_years': (base, low, high),
+              'special_ed_cost_per_year': (base, low, high),
+              'special_ed_years': (base, low, high),
+              'nonmedical_one_time': (base, low, high),
+              'prob_death_given_sequela': (base, low, high)  # optional
+          },
+          ...
+        }
+    health_samples : array-like length n_iter (per-case health-sector cost)
+    sequelae_mutually_exclusive : if True, sampled probs are renormalized to sum=1 (Dirichlet-like)
+    premature_mortality_method : 'human_capital' or 'VSL'
+    VSL_value : if using 'VSL'
+    """
+    np.random.seed(seed)
+
+    # fallback health samples if none provided
+    if health_samples is None:
+        # Health draw 
+        health_samples = np.random.lognormal(mean=np.log(42767), sigma=0.5, size=n_iter)
+    else:
+        health_samples = np.asarray(health_samples)
+        if len(health_samples) != n_iter:
+            raise ValueError("health_samples length must equal n_iter")
+
+    # prepare prob params
+    prob_beta_params = {}
+    for s, (base, low, high) in sequelae_probs.items():
+        a, b = beta_params_from_bounds(base, low, high)
+        prob_beta_params[s] = (a, b)
+
+    # prepare cost param templates for each sequela element & sample per-iteration
+    results_samples = np.zeros(n_iter)
+    components = {s: np.zeros(n_iter) for s in sequelae_probs}  # per-sequela total societal cost
+    comp_breakdown = {}  # dict of dicts for further breakdown 
+
+    # precompute any other parameterizations if needed
+    for i in range(n_iter):
+        # 1) sample sequela probabilities
+        sampled_p = {s: beta(a=prob_beta_params[s][0], b=prob_beta_params[s][1]).rvs()
+                     for s in sequelae_probs}
+
+        if sequelae_mutually_exclusive:
+            total_p = sum(sampled_p.values())
+            if total_p <= 0:
+                # fallback to base normalized
+                base_vals = {s: sequelae_probs[s][0] for s in sequelae_probs}
+                tot = sum(base_vals.values())
+                sampled_p = {s: base_vals[s] / tot for s in base_vals}
+            else:
+                sampled_p = {s: sampled_p[s] / total_p for s in sampled_p}
+
+        # 2) for each sequela, sample societal cost elements, compute per-sequela societal PV,
+        #    and multiply by sampled_p[s] (weighting)
+        total_societal_for_case = 0.0
+        for s, probs in sequelae_probs.items():
+            # retrieve the components dict for sequela
+            comps = sequelae_societal_costs[s]
+
+            # caregiver hours/year and wage -> annual caregiver cost -> PV over years
+            if 'caregiver_hours_per_year' in comps and 'caregiver_wage' in comps and 'care_years' in comps:
+                ch_base, ch_low, ch_high = comps['caregiver_hours_per_year']
+                cw_base, cw_low, cw_high = comps['caregiver_wage']
+                cy_base, cy_low, cy_high = comps['care_years']
+                # hours and wage sampled lognormal from bounds; years sampled uniform
+                sampled_hours = sample_lognormal_from_bounds(ch_low, ch_high)[0]
+                sampled_wage = sample_lognormal_from_bounds(cw_low, cw_high)[0]
+                sampled_years = uniform.rvs(loc=cy_low, scale=(cy_high - cy_low))
+                caregiver_pv = pv_annuity(sampled_hours * sampled_wage, sampled_years, discount_rate)
+
+            else:
+                caregiver_pv = 0.0
+
+            # lost earnings due to morbidity (per year * years)
+            if 'lost_earnings_per_year' in comps and 'lost_work_years' in comps and 'employment_rate' in comps:
+                le_base, le_low, le_high = comps['lost_earnings_per_year']
+                lw_base, lw_low, lw_high = comps['lost_work_years']
+                emp_base, emp_low, emp_high = comps['employment_rate']
+                sampled_le = sample_lognormal_from_bounds(le_low, le_high)[0]
+                sampled_lw = uniform.rvs(loc=lw_low, scale=(lw_high - lw_low))
+                # employment rate sample as beta
+                a_emp, b_emp = beta_params_from_bounds(emp_base, emp_low, emp_high)
+                sampled_emp = beta(a_emp, b_emp).rvs()
+                morbidity_pv = sampled_emp * pv_annuity(sampled_le, sampled_lw, discount_rate)
+            else:
+                morbidity_pv = 0.0
+
+            # special education (annual * years)
+            if 'special_ed_cost_per_year' in comps and 'special_ed_years' in comps:
+                se_base, se_low, se_high = comps['special_ed_cost_per_year']
+                sey_base, sey_low, sey_high = comps['special_ed_years']
+                sampled_se_cost = sample_lognormal_from_bounds(se_low, se_high)[0]
+                sampled_se_years = uniform.rvs(loc=sey_low, scale=(sey_high - sey_low))
+                special_ed_pv = pv_annuity(sampled_se_cost, sampled_se_years, discount_rate)
+            else:
+                special_ed_pv = 0.0
+
+            # nonmedical one-time cost
+            if 'nonmedical_one_time' in comps:
+                nm_base, nm_low, nm_high = comps['nonmedical_one_time']
+                sampled_nm = sample_lognormal_from_bounds(nm_low, nm_high)[0]
+            else:
+                sampled_nm = 0.0
+
+            # premature mortality: sequela may have prob_death_given_sequela
+            death_cost_pv = 0.0
+            if 'prob_death_given_sequela' in comps:
+                pd_base, pd_low, pd_high = comps['prob_death_given_sequela']
+                a_pd, b_pd = beta_params_from_bounds(pd_base, pd_low, pd_high)
+                sampled_pd = beta(a_pd, b_pd).rvs()
+                if premature_mortality_method == 'human_capital':
+                    # sample remaining working years lost and annual earnings similar to morbidity
+                    # use comps fields if present else defaults
+                    rem_base, rem_low, rem_high = comps.get('rem_work_years', (30, 0, 45))
+                    earn_base, earn_low, earn_high = comps.get('lost_earnings_per_year',
+                                                               (40000, 20000, 80000))
+                    sampled_rem = uniform.rvs(loc=rem_low, scale=(rem_high - rem_low))
+                    sampled_earn = sample_lognormal_from_bounds(earn_low, earn_high)[0]
+                    a_emp2, b_emp2 = beta_params_from_bounds(*comps.get('employment_rate', (0.6, 0.3, 0.8)))
+                    sampled_emp2 = beta(a_emp2, b_emp2).rvs()
+                    death_cost_pv = sampled_pd * sampled_emp2 * pv_annuity(sampled_earn, sampled_rem, discount_rate)
+                elif premature_mortality_method == 'VSL':
+                    if VSL_value is None:
+                        raise ValueError("VSL_value required for VSL method")
+                    # sample a small uncertainty around VSL? we will treat VSL as fixed for simplicity
+                    death_cost_pv = sampled_pd * VSL_value
+            # per-sequela societal cost = sum of PV components (per person with sequela)
+            per_sequela_societal = caregiver_pv + morbidity_pv + special_ed_pv + sampled_nm + death_cost_pv
+
+            # weight by sampled sequela probability
+            weighted = sampled_p[s] * per_sequela_societal
+
+            components[s][i] = weighted
+            total_societal_for_case += weighted
+
+        # total cost for this MC iteration = health sector (per-case) + total societal (weighted)
+        results_samples[i] = health_samples[i] + total_societal_for_case
+
+    # Summaries
+    def summarize(arr):
+        return {'mean': float(np.mean(arr)), 'median': float(np.median(arr)),
+                '2.5%': float(np.percentile(arr, 2.5)), '97.5%': float(np.percentile(arr, 97.5))}
+
+    output = {
+        'total_cost_samples': results_samples,
+        'summary_total': summarize(results_samples),
+        'summary_health_only': summarize(health_samples),
+        'summary_societal_by_sequela': {s: summarize(components[s]) for s in components},
+        'components_samples': components
+    }
+    return output
+
+# ----------------- Run simulation -----------------
+if __name__ == "__main__":
+    # sequela probabilities (base, low, high) - replace with congenital-specific following YMG
+    sequelae_probs = {
+        'cardiovascular': (0.09, 0.05, 0.13),
+        'meningovascular': (0.03, 0.01, 0.05),
+        'general_paresis': (0.02, 0.01, 0.03),
+        'tabes_dorsalis': (0.02, 0.01, 0.03),
+        'late_benign': (0.16, 0.10, 0.22)
+    }
+
+    # NOTE: will discuss with YMG and Update
+    sequelae_societal_costs = {
+        'cardiovascular': {
+            'caregiver_hours_per_year': (1040, 520, 2080),  # ~20 hrs/week
+            'caregiver_wage': (28.0, 15.0, 50.0),  # BLS median for home health aides
+            'care_years': (20, 10, 35),
+            'lost_earnings_per_year': (45000, 25000, 85000),
+            'lost_work_years': (18, 5, 35),
+            'employment_rate': (0.55, 0.3, 0.75),
+            'special_ed_cost_per_year': (0, 0, 0),
+            'special_ed_years': (0, 0, 0),
+            'nonmedical_one_time': (1500, 500, 5000),
+            'prob_death_given_sequela': (0.70, 0.50, 0.85),
+            'rem_work_years': (22, 5, 35)
+        },
+        'meningovascular': {
+            'caregiver_hours_per_year': (2080, 1040, 3120),  # full-time care
+            'caregiver_wage': (28.0, 15.0, 50.0),
+            'care_years': (25, 10, 40),
+            'lost_earnings_per_year': (50000, 30000, 90000),
+            'lost_work_years': (30, 10, 45),
+            'employment_rate': (0.45, 0.2, 0.7),
+            'special_ed_cost_per_year': (25000, 10000, 60000),
+            'special_ed_years': (12, 5, 18),
+            'nonmedical_one_time': (3000, 1000, 10000),
+            'prob_death_given_sequela': (0.75, 0.55, 0.90),
+            'rem_work_years': (28, 10, 40)
+        },
+        'general_paresis': {
+            'caregiver_hours_per_year': (2600, 1300, 4000),
+            'caregiver_wage': (28.0, 15.0, 50.0),
+            'care_years': (10, 5, 15),
+            'lost_earnings_per_year': (40000, 20000, 70000),
+            'lost_work_years': (20, 5, 35),
+            'employment_rate': (0.35, 0.2, 0.6),
+            'special_ed_cost_per_year': (20000, 8000, 40000),
+            'special_ed_years': (10, 3, 15),
+            'nonmedical_one_time': (1000, 300, 3000),
+            'prob_death_given_sequela': (0.65, 0.45, 0.80),
+            'rem_work_years': (18, 5, 30)
+        },
+        'tabes_dorsalis': {
+            'caregiver_hours_per_year': (1560, 780, 2500),
+            'caregiver_wage': (28.0, 15.0, 50.0),
+            'care_years': (18, 8, 30),
+            'lost_earnings_per_year': (30000, 15000, 60000),
+            'lost_work_years': (12, 3, 25),
+            'employment_rate': (0.50, 0.25, 0.75),
+            'special_ed_cost_per_year': (10000, 3000, 20000),
+            'special_ed_years': (6, 2, 10),
+            'nonmedical_one_time': (800, 200, 2500),
+            'prob_death_given_sequela': (0.60, 0.40, 0.75),
+            'rem_work_years': (15, 5, 25)
+        },
+        'late_benign': {
+            'caregiver_hours_per_year': (100, 0, 500),
+            'caregiver_wage': (28.0, 15.0, 50.0),
+            'care_years': (2, 0, 5),
+            'lost_earnings_per_year': (5000, 0, 15000),
+            'lost_work_years': (2, 0, 5),
+            'employment_rate': (0.60, 0.3, 0.8),
+            'special_ed_cost_per_year': (2000, 0, 5000),
+            'special_ed_years': (2, 0, 5),
+            'nonmedical_one_time': (300, 100, 1000),
+            'prob_death_given_sequela': (0.05, 0.0, 0.1),
+            'rem_work_years': (5, 0, 10)
+        }
+    }
+
+
+    # run the Monte Carlo
+    n_iter = n_iter
+    seed = seed
+    out = societal_weighted_mc(
+        n_iter=n_iter,
+        sequelae_probs=sequelae_probs,
+        sequelae_societal_costs=sequelae_societal_costs,
+        health_samples=health_samples,  # replace None with health-sector per-case samples array
+        discount_rate=discount_rate,
+        seed=seed,
+        sequelae_mutually_exclusive=False,  # set True if outcomes are mutually exclusive and sum to 1
+        premature_mortality_method='human_capital',
+        VSL_value=None
+    )
+
+    # show summaries
+    print("Total (health + societal) per-case mean: ${:,.0f}".format(out['summary_total']['mean']))
+    print("95% UI: ${:,.0f} - ${:,.0f}".format(out['summary_total']['2.5%'], out['summary_total']['97.5%']))
+    print("\nBreakdown (mean weighted societal by sequela):")
+    for s, summ in out['summary_societal_by_sequela'].items():
+        print(f"  {s}: mean societal contribution = ${summ['mean']:.0f} (2.5% ${summ['2.5%']:.0f} — 97.5% ${summ['97.5%']:.0f})")
+
+```
+
+    Total (health + societal) per-case mean: $288,816
+    95% UI: $157,832 - $364,575
+    
+    Breakdown (mean weighted societal by sequela):
+      cardiovascular: mean societal contribution = $98599 (2.5% $41941 — 97.5% $190300)
+      meningovascular: mean societal contribution = $54514 (2.5% $20386 — 97.5% $113591)
+      general_paresis: mean societal contribution = $20126 (2.5% $8309 — 97.5% $40725)
+      tabes_dorsalis: mean societal contribution = $17773 (2.5% $6960 — 97.5% $37450)
+      late_benign: mean societal contribution = $55036 (2.5% $19 — 97.5% $45129)
+    
+
+
+```python
+# Using Value of Statistical Life Approach
+n_iter = n_iter
+seed = seed
+out = societal_weighted_mc(
+    n_iter = n_iter,
+    sequelae_probs = sequelae_probs,
+    sequelae_societal_costs = sequelae_societal_costs,
+    health_samples = health_samples,
+    discount_rate = discount_rate,
+    seed = seed,
+    sequelae_mutually_exclusive = False,
+    premature_mortality_method = "VSL",
+    VSL_value = 13_700_000
+)
+# show summaries
+print("Total (health + societal) per-case mean: ${:,.0f}".format(out['summary_total']['mean']))
+print("95% UI: ${:,.0f} - ${:,.0f}".format(out['summary_total']['2.5%'], out['summary_total']['97.5%']))
+print("\nBreakdown (mean weighted societal by sequela):")
+for s, summ in out['summary_societal_by_sequela'].items():
+    print(f"  {s}: mean societal contribution = ${summ['mean']:.0f} (2.5% ${summ['2.5%']:.0f} — 97.5% ${summ['97.5%']:.0f})")
+```
+
+    Total (health + societal) per-case mean: $1,969,426
+    95% UI: $1,320,217 - $2,483,692
+    
+    Breakdown (mean weighted societal by sequela):
+      cardiovascular: mean societal contribution = $939735 (2.5% $523756 — 97.5% $1457135)
+      meningovascular: mean societal contribution = $353436 (2.5% $154755 — 97.5% $636348)
+      general_paresis: mean societal contribution = $196090 (2.5% $102991 — 97.5% $319385)
+      tabes_dorsalis: mean societal contribution = $180076 (2.5% $94516 — 97.5% $298682)
+      late_benign: mean societal contribution = $257321 (2.5% $27217 — 97.5% $283848)
+    
+
+
+```python
+# Estimate congenital syphilis DALYs
+cs_dalys = calc_dalys_beta_both(
+    n_cases=1,
+    dw_mean=.315, dw_low=.159, dw_high=.471,
+    duration_years=10,
+    prob_death=.05,
+    life_expectancy_at_death=65,
+    discount_rate=discount_rate,
+    n_iter=10_000,
+    seed=2025
+)
+```
+
+
+```python
+cs_dalys.keys()
+```
+
+
+
+
+    dict_keys(['per_case', 'total', 'samples'])
+
+
+
+
+```python
+# Estimate congenital syphilis DALYs
+lbw_dalys = calc_dalys_beta_both(
+    n_cases=1,
+    dw_mean=.106, dw_low=.035, dw_high=.159,
+    duration_years=10,
+    prob_death=.05,
+    life_expectancy_at_death=78,
+    discount_rate=discount_rate,
+    n_iter=10_000,
+    seed=2025
+)
+```
+
+
+```python
+@dataclass
+class CostInputs:
+    # Costs
+    nicu_cost: float = 50_000
+    nicu_cost_st: float = 12000
+
+    poc_test: float = 20
+    poc_test_st: float = 4
+
+    penicillin_cost: float = 20
+    penicillin_cost_st: float = 4
+
+    rpr_cost: float = 9.82                     # [6.71 - 26.85]
+    rpr_cost_st: float = std_2(6.71, 26.85)
+
+    fta_cost: float = 31.07                    # [20.14 - 53.71]
+    fta_cost_st: float = std_2(20.14, 53.71)
+
+    iufd_cost: float = 13_049.29                # [10741.88 - 20141.02]
+    iufd_cost_st: float = std_2(10_741.88, 20_141.02)
+
+    preterm_del: float = 37_780.36              # [26854.69 - 53709.38]
+    preterm_del_st: float = std_2(26_854.69, 53_709.38)
+
+    term_del: float = 13_828.31                 # [6713.67 - 26854.69]
+    term_del_st: float = std_2(6_713.67, 26_854.69)
+
+    nnd_preterm_cost: float = 189_784.19        # [147700.80 - 268546.91]
+    nnd_preterm_cost_st: float = std_2(147_700.80, 268_546.91)
+
+    stillborn_term_cost: float = 141_792.46     # [120846.11 - 201410.18]
+    stillborn_term_cost_st: float = std_2(120_846.11, 201_410.18)
+
+    workup_cs_cost: float = 1_643.68            # [939.91 - 2685.47]
+    workup_cs_cost_st: float = std_2(939.91, 2_685.47)
+
+costinputs = CostInputs()
+
+```
+
+
+```python
+@dataclass
+class LifetimeParameters:
+    # Long term survival probabilities
+    cs_survival_rate: float = 0.95          # Surv to adulthood with CS
+    neuro_survival_rate: float = 0.90       # Surv to adulthood neuro
+
+    # Quality of life impacts
+    cs_dw: float = 0.315 
+    cs_dw_st: float = std_2(0.159, 0.471)
+    
+    cs_qaly_annual: float = 0.85            # Annual QALY weight for CS
+    neuro_qaly_pa: float = 0.70             # Annual QALY weight neuro
+
+    # Healthcare costs annual
+    cs_direct_annual: float = 5_000         # Annual healthcare costs
+    neuro_direct_annual: float = 15_000     # Annual costs neuro
+
+    # Educational impacts
+    special_ed_annual: float = 12_000       # Annual special ed costs
+    educ_years: float = 14                  # Years of special ed (from pre-K)
+
+lifetimeparameters = LifetimeParameters()
+```
+
+
+```python
+# Low birth weight lifetime DALYs
+lbw_daly: float = 0.106                        # [0.053, 0.159]
+lbw_daly_range: tuple = (0.035, 0.159)
+disc_lbw_daly, disc_lbw_daly_std = disc_daly(lbw_daly, lbw_daly_range)
+
+# Congenital syphilis lifetime DALys
+cs_dw: float = 0.315                           # [0.159, 0.471]
+cs_dw_range: tuple = (0.159, 0.471)
+disc_cs_dw, disc_cs_dw_std = disc_daly(cs_dw, cs_dw_range)
+
+# Neurological complications -- assume same as deafness
+# Less than for intellectual disability that is .469 - .588
+neuro_dw: float = 0.2
+neuro_dw_sd: tuple = (.167, .281)
+disc_neuro_dw, disc_neuro_dw_std = disc_daly(neuro_dw, neuro_dw_sd)
+
+# Weights for maternal CS. Assume that this will last until 21 years
+cs_mat: float = 0.12                           # [0.10 - 0.30]
+cs_mat_sd: tuple = (0.70, 0.90)
+disc_cs_mat, disc_cs_mat_std = disc_daly(cs_mat, cs_mat_sd, life_expectancy=21)
+disc_cs_mat
+
+# Parental (Maternal) burden -- assume for 1 year
+# Assume similar to moderate depression
+iufd_mat_daly: float = 0.396                         # [0.268 - 0.535]
+iufd_mat_sd: float = std_2(0.268, 0.535)
+
+# Assume similar to major depression lasting a year
+nnd_mat_daly: float = 0.658                          # [0.528 - 0.768]
+nnd_mat_sd: float = std_2(0.528, 0.768)
+
+stillbirth_mat_daly: float = 0.74                  # [0.60 - 0.80]
+stillbirth_mat_sd: float = std_2(0.60, 0.80)
+
+preterm_mat_daly: float = 0.75                      # [0.60 - 0.80]
+preterm_mat_sd: float = std_2(0.60, 0.80)
+
+```
+
+
+```python
+# Implement a data class for cost inputs
+@dataclass
+class CostInputs:
+    # Costs
+    nicu_cost: float = 50_000
+    nicu_cost_st: float = 12000
+
+    poc_test: float = 20
+    poc_test_st: float = 4
+
+    penicillin_cost: float = 20
+    penicillin_cost_st: float = 4
+
+    rpr_cost: float = 9.82                     # [6.71 - 26.85]
+    rpr_cost_st: float = std_2(6.71, 26.85)
+
+    fta_cost: float = 31.07                    # [20.14 - 53.71]
+    fta_cost_st: float = std_2(20.14, 53.71)
+
+    iufd_cost: float = 13_049.29                # [10741.88 - 20141.02]
+    iufd_cost_st: float = std_2(10_741.88, 20_141.02)
+
+    preterm_del: float = 37_780.36              # [26854.69 - 53709.38]
+    preterm_del_st: float = std_2(26_854.69, 53_709.38)
+
+    term_del: float = 13_828.31                 # [6713.67 - 26854.69]
+    term_del_st: float = std_2(6_713.67, 26_854.69)
+
+    nnd_preterm_cost: float = 189_784.19        # [147700.80 - 268546.91]
+    nnd_preterm_cost_st: float = std_2(147_700.80, 268_546.91)
+
+    stillborn_term_cost: float = 141_792.46     # [120846.11 - 201410.18]
+    stillborn_term_cost_st: float = std_2(120_846.11, 201_410.18)
+
+    workup_cs_cost: float = 1_643.68            # [939.91 - 2685.47]
+    workup_cs_cost_st: float = std_2(939.91, 2_685.47)
+    
+    cs_lifetime_hs_cost: float = 42767.72
+    cs_lifetime_hs_cost_st: float = std_2(27087.95, 66247.52)
+    
+    cs_lifetime_hc_cost: float = 257_642
+    cs_lifetime_hc_cost_st: float = std_2(129_681, 381_643)
+
+    cs_lifetime_vsl_cost: float = 2_933_646
+    cs_lifetime_vsl_cost_st: float = std_2(1_645_180, 4_377_169)
+    
+    lbw_hs_costs: float = 64_086
+    lbw_hs_costs_st: float = std_2(60_205, 67_891)
+    
+    lbw_lf_costs: float = 102_673  # $51589 in 2005
+    lbw_lf_costs_st: float = std_2(96_513, 108_833)
+    
+costinputs = CostInputs()
+```
+
+<u>Useful citations</u>
+
+- [Ignored and undervalued in public health: a systematic review of health state utility values associated with syphilis infection](https://pmc.ncbi.nlm.nih.gov/articles/PMC10863090/)
+- [Stillbirths: Economic and psychosocial consequences](https://www.thelancet.com/journals/lancet/article/PIIS0140-6736(15)00836-3/fulltext)
+- [Estimates of the Lifetime Productivity Costs of Chlamydia, Gonorrhea, and Syphilis in the United States](https://pmc.ncbi.nlm.nih.gov/articles/PMC11392646/)
+- [The Estimated Lifetime Medical Cost of Syphilis in the United States](https://pmc.ncbi.nlm.nih.gov/articles/PMC10028531/)
+
+<u>Updated treatment costs from Chesson and Peterman</u>
+- [The Estimated Lifetime Medical Cost of Syphilis in the United States](https://pmc.ncbi.nlm.nih.gov/articles/PMC10028531/)
+- Base year: 2019
+- Adjust to 2025 using the consumer price index for healthcare
+- The add societal costs
+
+
+```python
+# Helper function for inflation adjustment
+cpi_2025 = 585.10
+cpi_2019 = 494.629
+inflation_factor = cpi_2025 / cpi_2019
+
+def adjust_2025(cost_2019):
+    return cost_2019 * inflation_factor
+```
+
+
+```python
+# Simulate osts (Gamma distribution)
+cost_samples = {}
+for cost_name, cost_value in costinputs.__dict__.items():
+    if not cost_name.endswith('_st'): # Skip standard deviation parameters
+        cost_std = getattr(costinputs, f"{cost_name}_st", None)
+        if cost_std:
+            shape = (cost_value / cost_std) ** 2
+            scale = (cost_std ** 2) / cost_value
+            cost_samples[cost_name] = gamma.rvs(a=shape, scale=scale, size=10_000)
+```
+
+
+```python
+cost_samples.keys()
+```
+
+
+
+
+    dict_keys(['nicu_cost', 'poc_test', 'penicillin_cost', 'rpr_cost', 'fta_cost', 'iufd_cost', 'preterm_del', 'term_del', 'nnd_preterm_cost', 'stillborn_term_cost', 'workup_cs_cost', 'cs_lifetime_hs_cost', 'cs_lifetime_hc_cost', 'cs_lifetime_vsl_cost', 'lbw_hs_costs', 'lbw_lf_costs'])
+
+
+
+
+```python
+cost_samples["iufd_cost"].mean()
+```
+
+
+
+
+    np.float64(13032.58409733549)
+
+
+
+
+```python
+# Other cost parameters
+vsl_dhhs = 13_700_000                         # US DHHS value of statistical life 2025
+hc_calc = 1_921_000                           # Value of life using a human capital approach
+discounted_life_expectancy = np.sum([1/((1+discount_rate)**t) for t in range(int(life_expectancy))])
+print(f"The discounted life expectancy at birth is {discounted_life_expectancy:.2f} years")
+```
+
+    The discounted life expectancy at birth is 27.55 years
+    
+
+<u>Cost simulation notes</u>
+- We use gamma distribution for costs
+- We estimate the mean cost of IUFD from a health sector perspective as \\$13,019. This is higher than the 2021 value of \\$9,220 found in [The economic burden associated with stillbirth: A systematic review](https://onlinelibrary.wiley.com/doi/10.1111/birt.12714). If the 2021 values are inflated to 2025 using the CPI as outlined above, the value rises to \\$10,888, which is still lower than our estimate. We will use our own estimates but flag this as a potential limitation.
+
+
+```python
+# ---------------- core simulation ----------------
+np.random.seed(2025)
+COHORT = 100_000
+p_active_syph = 0.01
+screen_baseline = 0.40
+screen_enhanced = 0.90
+sens_serology = 0.98
+adequate_tx_given_positive = 0.85
+timely_treatment_fraction = 0.85
+
+baseline = {"preterm":{"alpha":1040,"beta":8960},"lbw":{"alpha":850,"beta":9150},
+            "stillbirth":{"alpha":55,"beta":9945},"neonatal_death":{"alpha":36,"beta":9964},
+            "miscarriage":{"alpha":1500,"beta":8500}}
+prop_late_fetal = 0.49
+untreated_abs = {"preterm":0.232,"lbw":0.234,"stillbirth":0.264,"miscarriage":0.149,"neonatal_death":0.162,"cs_any":0.360}
+tx_rr_params = {"preterm":{"rr":0.48,"lo":0.39,"hi":0.58},
+                "lbw":{"rr":0.50,"lo":0.42,"hi":0.59},
+                "stillbirth":{"rr":0.21,"lo":0.10,"hi":0.35},
+                "neonatal_death":{"rr":0.20,"lo":0.13,"hi":0.32},
+                "cs_any":{"rr":0.03,"lo":0.02,"hi":0.07}}
+prop_cs_symptomatic = 0.38
+N = 10_000
+
+def ln_params_from_ci(m, lo, hi):
+    mu = np.log(m); sigma = (np.log(hi)-np.log(lo))/(2*1.96); return mu, sigma
+def draw_rr(key, size):
+    mu, sigma = ln_params_from_ci(tx_rr_params[key]["rr"],tx_rr_params[key]["lo"],tx_rr_params[key]["hi"])
+    return lognorm(s=sigma, scale=np.exp(mu)).rvs(size=size)
+def draw_baseline(par): return beta(par["alpha"], par["beta"]).rvs(size=N)
+b_preterm = draw_baseline(baseline["preterm"]); b_lbw = draw_baseline(baseline["lbw"])
+b_still = draw_baseline(baseline["stillbirth"]); b_neo = draw_baseline(baseline["neonatal_death"])
+b_mis = draw_baseline(baseline["miscarriage"])
+rr_preterm = draw_rr("preterm", N); rr_lbw = draw_rr("lbw", N); rr_still = draw_rr("stillbirth", N)
+rr_neo = draw_rr("neonatal_death", N); rr_cs = draw_rr("cs_any", N)
+def beta_from_mean(m, n=1000):
+    a=m*n; b=(1-m)*n; return beta(a,b).rvs(size=N)
+u_preterm=beta_from_mean(untreated_abs["preterm"]); u_lbw=beta_from_mean(untreated_abs["lbw"])
+u_still=beta_from_mean(untreated_abs["stillbirth"]); u_mis=beta_from_mean(untreated_abs["miscarriage"])
+u_neo=beta_from_mean(untreated_abs["neonatal_death"]); u_cs=beta_from_mean(untreated_abs["cs_any"])
+
+def strategy_outcomes(screen_cov):
+    p_detect = screen_cov * sens_serology
+    p_adequate = p_detect * adequate_tx_given_positive * timely_treatment_fraction
+    preterm_syph = p_adequate*(u_preterm*rr_preterm) + (1-p_adequate)*u_preterm
+    lbw_syph     = p_adequate*(u_lbw*rr_lbw)       + (1-p_adequate)*u_lbw
+    still_syph   = p_adequate*(u_still*rr_still)   + (1-p_adequate)*u_still
+    neo_syph     = p_adequate*(u_neo*rr_neo)       + (1-p_adequate)*u_neo
+    mis_syph     = u_mis
+    cs_any_syph  = p_adequate*(u_cs*rr_cs)         + (1-p_adequate)*u_cs
+    cs_comp_syph = cs_any_syph * prop_cs_symptomatic
+    cs_uncomp_syph = cs_any_syph * (1 - prop_cs_symptomatic)
+    p = p_active_syph
+    preterm = p*preterm_syph + (1-p)*b_preterm
+    lbw     = p*lbw_syph     + (1-p)*b_lbw
+    still   = p*still_syph   + (1-p)*b_still
+    neo     = p*neo_syph     + (1-p)*b_neo
+    mis     = p*mis_syph     + (1-p)*b_mis
+    iufd = still * prop_late_fetal
+    cs_comp = p * cs_comp_syph
+    cs_uncomp = p * cs_uncomp_syph
+    def to_counts(x): return np.round(x*COHORT).astype(int)
+    return {"Preterm births":to_counts(preterm),
+            "Low birth weight":to_counts(lbw),
+            "Stillbirths (≥20w)":to_counts(still),
+            "IUFD (≥28w subset)":to_counts(iufd),
+            "Miscarriages (<20w clinical)":to_counts(mis),
+            "Neonatal deaths (<28d)":to_counts(neo),
+            "Congenital syphilis – complicated":to_counts(cs_comp),
+            "Congenital syphilis – uncomplicated":to_counts(cs_uncomp)}
+
+out_40 = strategy_outcomes(screen_baseline)
+out_90 = strategy_outcomes(screen_enhanced)
+```
+
+
+```python
+out_40
+```
+
+
+
+
+    {'Preterm births': array([10384, 10264, 10919, ..., 10663, 10591, 10529], shape=(10000,)),
+     'Low birth weight': array([8449, 8485, 8996, ..., 8719, 8182, 8823], shape=(10000,)),
+     'Stillbirths (≥20w)': array([760, 683, 727, ..., 940, 783, 680], shape=(10000,)),
+     'IUFD (≥28w subset)': array([373, 334, 356, ..., 461, 383, 333], shape=(10000,)),
+     'Miscarriages (<20w clinical)': array([14501, 15236, 15568, ..., 15075, 14905, 14765], shape=(10000,)),
+     'Neonatal deaths (<28d)': array([387, 479, 521, ..., 479, 461, 547], shape=(10000,)),
+     'Congenital syphilis – complicated': array([100,  94,  93, ..., 106,  96,  98], shape=(10000,)),
+     'Congenital syphilis – uncomplicated': array([162, 153, 152, ..., 173, 156, 160], shape=(10000,))}
+
+
+
+
+```python
+np.arange(0.4,.96, .01)
+```
+
+
+
+
+    array([0.4 , 0.41, 0.42, 0.43, 0.44, 0.45, 0.46, 0.47, 0.48, 0.49, 0.5 ,
+           0.51, 0.52, 0.53, 0.54, 0.55, 0.56, 0.57, 0.58, 0.59, 0.6 , 0.61,
+           0.62, 0.63, 0.64, 0.65, 0.66, 0.67, 0.68, 0.69, 0.7 , 0.71, 0.72,
+           0.73, 0.74, 0.75, 0.76, 0.77, 0.78, 0.79, 0.8 , 0.81, 0.82, 0.83,
+           0.84, 0.85, 0.86, 0.87, 0.88, 0.89, 0.9 , 0.91, 0.92, 0.93, 0.94,
+           0.95])
+
+
+
+
+```python
+def diff_dict(d40, d90):
+    keys = list(d40.keys())
+    return {f"Δ {k} (prevented)": (np.asarray(d40[k]) - np.asarray(d90[k])) for k in keys}
+delta = diff_dict(out_40, out_90)
+df_inc = pd.DataFrame(delta)
+df_inc["iteration"] = np.arange(len(next(iter(delta.values()))))
+df_inc = df_inc[["iteration"] + [c for c in df_inc.columns if c != "iteration"]]
+
+# --------------- Correct DALY & QALY mapping ---------------
+def AF(t, r): 
+    if r==0: return t
+    return (1-(1+r)**(-t))/r
+
+r = 0.03
+L0 = 86.0
+AF_L0 = AF(L0, r)
+AF_025 = AF(0.25, r)
+AF_10  = AF(1.0, r)
+AF_LT  = AF(70.0, r)
+AF_PLBW = AF(0.25, r)
+
+col_map = {
+    "preterm": "Δ Preterm births (prevented)",
+    "lbw": "Δ Low birth weight (prevented)",
+    "still": "Δ Stillbirths (≥20w) (prevented)",
+    "iufd": "Δ IUFD (≥28w subset) (prevented)",
+    "miscarriage": "Δ Miscarriages (<20w clinical) (prevented)",
+    "neodeath": "Δ Neonatal deaths (<28d) (prevented)",
+    "cs_comp": "Δ Congenital syphilis – complicated (prevented)",
+    "cs_uncomp": "Δ Congenital syphilis – uncomplicated (prevented)",
+}
+
+df_inc["DALYs_prevented_fix"] = 0.0
+df_inc["QALYs_gained_fix"] = 0.0
+
+# Neonatal deaths
+df_inc["DALYs_prevented_fix"] += df_inc[col_map["neodeath"]]*AF_L0
+df_inc["QALYs_gained_fix"]    += df_inc[col_map["neodeath"]]*AF_L0
+
+# CS uncomplicated acute
+df_inc["DALYs_prevented_fix"] += df_inc[col_map["cs_uncomp"]]*0.053*AF_025
+df_inc["QALYs_gained_fix"]    += df_inc[col_map["cs_uncomp"]]*0.053*AF_025
+
+# CS complicated acute
+df_inc["DALYs_prevented_fix"] += df_inc[col_map["cs_comp"]]*0.315*AF_10
+df_inc["QALYs_gained_fix"]    += df_inc[col_map["cs_comp"]]*0.315*AF_10
+
+# CS complicated long-term sequelae (20%)
+lt_cases = 0.20*df_inc[col_map["cs_comp"]]
+df_inc["DALYs_prevented_fix"] += lt_cases*0.100*AF_LT
+df_inc["QALYs_gained_fix"]    += lt_cases*0.100*AF_LT
+
+# Optional preterm/LBW off (consistent with prior)
+# If enabling, add DW*duration to both DALY and QALY same way.
+```
+
+
+```python
+df_inc[:5]
+```
+
+
+
+
+<div>
+<style scoped>
+    .dataframe tbody tr th:only-of-type {
+        vertical-align: middle;
+    }
+
+    .dataframe tbody tr th {
+        vertical-align: top;
+    }
+
+    .dataframe thead th {
+        text-align: right;
+    }
+</style>
+<table border="1" class="dataframe">
+  <thead>
+    <tr style="text-align: right;">
+      <th></th>
+      <th>iteration</th>
+      <th>Δ Preterm births (prevented)</th>
+      <th>Δ Low birth weight (prevented)</th>
+      <th>Δ Stillbirths (≥20w) (prevented)</th>
+      <th>Δ IUFD (≥28w subset) (prevented)</th>
+      <th>Δ Miscarriages (&lt;20w clinical) (prevented)</th>
+      <th>Δ Neonatal deaths (&lt;28d) (prevented)</th>
+      <th>Δ Congenital syphilis – complicated (prevented)</th>
+      <th>Δ Congenital syphilis – uncomplicated (prevented)</th>
+      <th>DALYs_prevented_fix</th>
+      <th>QALYs_gained_fix</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <th>0</th>
+      <td>0</td>
+      <td>27</td>
+      <td>21</td>
+      <td>45</td>
+      <td>23</td>
+      <td>0</td>
+      <td>27</td>
+      <td>28</td>
+      <td>47</td>
+      <td>854.649648</td>
+      <td>854.649648</td>
+    </tr>
+    <tr>
+      <th>1</th>
+      <td>1</td>
+      <td>24</td>
+      <td>22</td>
+      <td>52</td>
+      <td>26</td>
+      <td>0</td>
+      <td>26</td>
+      <td>27</td>
+      <td>44</td>
+      <td>823.012478</td>
+      <td>823.012478</td>
+    </tr>
+    <tr>
+      <th>2</th>
+      <td>2</td>
+      <td>30</td>
+      <td>27</td>
+      <td>47</td>
+      <td>23</td>
+      <td>0</td>
+      <td>28</td>
+      <td>27</td>
+      <td>44</td>
+      <td>884.432188</td>
+      <td>884.432188</td>
+    </tr>
+    <tr>
+      <th>3</th>
+      <td>3</td>
+      <td>22</td>
+      <td>22</td>
+      <td>41</td>
+      <td>20</td>
+      <td>0</td>
+      <td>23</td>
+      <td>28</td>
+      <td>45</td>
+      <td>731.784212</td>
+      <td>731.784212</td>
+    </tr>
+    <tr>
+      <th>4</th>
+      <td>4</td>
+      <td>22</td>
+      <td>23</td>
+      <td>35</td>
+      <td>17</td>
+      <td>0</td>
+      <td>29</td>
+      <td>31</td>
+      <td>50</td>
+      <td>918.773260</td>
+      <td>918.773260</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+
+
+
+```python
+df_inc.columns
+```
+
+
+
+
+    Index(['iteration', 'Δ Preterm births (prevented)',
+           'Δ Low birth weight (prevented)', 'Δ Stillbirths (≥20w) (prevented)',
+           'Δ IUFD (≥28w subset) (prevented)',
+           'Δ Miscarriages (<20w clinical) (prevented)',
+           'Δ Neonatal deaths (<28d) (prevented)',
+           'Δ Congenital syphilis – complicated (prevented)',
+           'Δ Congenital syphilis – uncomplicated (prevented)',
+           'DALYs_prevented_fix', 'QALYs_gained_fix'],
+          dtype='object')
+
+
+
+
+```python
+df_inc["iufd_costs_hs"] = df_inc['Δ IUFD (≥28w subset) (prevented)'] * cost_samples["iufd_cost"]
+df_inc["iufd_costs_vsl"] = df_inc['Δ IUFD (≥28w subset) (prevented)'] * vsl_dhhs
+df_inc["iufd_costs_hc"] = df_inc['Δ IUFD (≥28w subset) (prevented)'] * hc_calc
+df_inc["iufd_vsl_soc"] = df_inc["iufd_costs_vsl"] + df_inc["iufd_costs_hs"]
+df_inc["iufd_hc_soc"] = df_inc["iufd_costs_hc"] + df_inc["iufd_costs_hs"]
+
+# Maternal DALYs averted
+x = simulate_disability_weights(iufd_mat_daly, iufd_mat_sd, n_samples=10_000, random_state=None)[0]
+df_inc["iufd_daly_undisc"] = df_inc['Δ IUFD (≥28w subset) (prevented)'] * life_expectancy + x
+df_inc["iufd_daly_disc"] = df_inc['Δ IUFD (≥28w subset) (prevented)'] * discounted_life_expectancy + x
+df_inc["iufd_daly_disc"].quantile([.025, .5, .975])
+```
+
+
+
+
+    0.025    441.252569
+    0.500    606.447995
+    0.975    716.626937
+    Name: iufd_daly_disc, dtype: float64
+
+
+
+
+```python
+df_inc["nnd_costs_hs"] = df_inc['Δ Neonatal deaths (<28d) (prevented)'] * cost_samples["nnd_preterm_cost"]
+df_inc["nnd_costs_vsl"] = df_inc['Δ Neonatal deaths (<28d) (prevented)'] * vsl_dhhs
+df_inc["nnd_costs_hc"] = df_inc['Δ Neonatal deaths (<28d) (prevented)'] * hc_calc
+df_inc["nnd_vsl_soc"] = df_inc["nnd_costs_vsl"] + df_inc["nnd_costs_hs"]
+df_inc["nnd_hc_soc"] = df_inc["nnd_costs_hc"] + df_inc["nnd_costs_hs"]
+
+# Maternal DALYs averted
+x = simulate_disability_weights(iufd_mat_daly, iufd_mat_sd, n_samples=10_000, random_state=None)[0]
+df_inc["nnd_daly_undisc"] = df_inc['Δ Neonatal deaths (<28d) (prevented)'] * life_expectancy + x
+df_inc["nnd_daly_disc"] = df_inc['Δ Neonatal deaths (<28d) (prevented)'] * discounted_life_expectancy + x
+df_inc["nnd_daly_disc"].quantile([.025, .5, .975])
+```
+
+
+
+
+    0.025    606.526201
+    0.500    744.303671
+    0.975    909.503596
+    Name: nnd_daly_disc, dtype: float64
+
+
+
+
+```python
+df_inc["sb_costs_hs"] = df_inc['Δ Stillbirths (≥20w) (prevented)'] * cost_samples["stillborn_term_cost"]
+df_inc["sb_costs_vsl"] = df_inc['Δ Stillbirths (≥20w) (prevented)'] * vsl_dhhs
+df_inc["sb_costs_hc"] = df_inc['Δ Stillbirths (≥20w) (prevented)'] * hc_calc
+df_inc["sb_vsl_soc"] = df_inc["sb_costs_vsl"] + df_inc["sb_costs_hs"]
+df_inc["sb_hc_soc"] = df_inc["sb_costs_hc"] + df_inc["sb_costs_hs"]
+
+# Maternal DALYs averted
+x = simulate_disability_weights(iufd_mat_daly, iufd_mat_sd, n_samples=10_000, random_state=None)[0]
+df_inc["sb_daly_undisc"] = df_inc['Δ Stillbirths (≥20w) (prevented)'] * life_expectancy + x
+df_inc["sb_daly_disc"] = df_inc['Δ Stillbirths (≥20w) (prevented)'] * discounted_life_expectancy + x
+df_inc["sb_daly_disc"].quantile([.025, .5, .975])
+```
+
+
+
+
+    0.025     937.050480
+    0.500    1212.624379
+    0.975    1433.029919
+    Name: sb_daly_disc, dtype: float64
+
+
+
+
+```python
+df_inc["lbw_costs_hs"] = df_inc['Δ Low birth weight (prevented)'] * cost_samples["lbw_hs_costs"]
+df_inc["lbw_costs_soc"] = df_inc["Δ Low birth weight (prevented)"] + cost_samples["lbw_lf_costs"]
+df_inc["lbw_daly_undisc"] = df_inc['Δ Low birth weight (prevented)'] * lbw_dalys["samples"]["per_case_undiscounted"] + cs_mat
+df_inc["lbw_daly_disc"] = df_inc['Δ Low birth weight (prevented)'] * lbw_dalys["samples"]["per_case_discounted"] + cs_mat
+df_inc["lbw_daly_disc"].quantile([.025, .5, .975])
+```
+
+
+
+
+    0.025    37.415463
+    0.500    53.202842
+    0.975    74.435702
+    Name: lbw_daly_disc, dtype: float64
+
+
+
+
+```python
+# Complicated congenital syphilis
+df_inc["cs_costs_hs"] = df_inc['Δ Congenital syphilis – complicated (prevented)'] * cost_samples["cs_lifetime_hs_cost"]
+df_inc["cs_costs_hc_soc"] = df_inc["Δ Congenital syphilis – complicated (prevented)"] + cost_samples["cs_lifetime_hc_cost"]
+df_inc["cs_costs_vsl_soc"] = df_inc["Δ Congenital syphilis – complicated (prevented)"] + cost_samples["cs_lifetime_vsl_cost"]
+df_inc["cs_daly_undisc"] = df_inc['Δ Congenital syphilis – complicated (prevented)'] * cs_dalys["samples"]["per_case_undiscounted"] + cs_mat
+df_inc["cs_daly_disc"] = df_inc['Δ Congenital syphilis – complicated (prevented)'] * cs_dalys["samples"]["per_case_discounted"] + cs_mat
+df_inc["cs_daly_disc"].quantile([.025, .5, .975])
+```
+
+
+
+
+    0.025     71.427917
+    0.500    104.570734
+    0.975    147.409202
+    Name: cs_daly_disc, dtype: float64
+
+
+
+
+```python
+df_inc["disc_dalys"] = df_inc["iufd_daly_disc"] + df_inc["nnd_daly_disc"] + df_inc["sb_daly_disc"] + df_inc["lbw_daly_disc"] + df_inc["cs_daly_disc"] 
+df_inc["undisc_dalys"] = df_inc["iufd_daly_undisc"] + df_inc["nnd_daly_undisc"] + df_inc["sb_daly_undisc"] + df_inc["lbw_daly_undisc"] + df_inc["cs_daly_undisc"] 
+```
+
+
+```python
+# Remember to deduct screening and treatment costs from total costs
+pop = 100_000
+### Weighted screening and testing costs to be adjusted and then delete this comment
+placeholder = 100 # Placeholder screening and treatment
+program_costs = pop * placeholder
+```
+
+
+```python
+df_inc["soc_costs"] = df_inc["iufd_vsl_soc"] + df_inc["nnd_vsl_soc"] + df_inc["sb_vsl_soc"] + df_inc["lbw_costs_soc"] + df_inc["cs_costs_vsl_soc"] - program_costs
+df_inc["hs_costs"] = df_inc["iufd_costs_hs"] + df_inc["nnd_costs_hs"] + df_inc["sb_costs_hs"] + df_inc["lbw_costs_hs"] + df_inc["cs_costs_hs"] - program_costs
+```
+
+
+```python
+fig, ax = plt.subplots(figsize=(8, 5))
+plt.scatter(df_inc["disc_dalys"], -df_inc["soc_costs"], s=1, color="g")
+plt.plot([-2_000, 5_000], [-100_000_000, 250_000_000], label="$50K/DALY", ls="--")
+plt.plot([-2_000, 5_000], [-200_000_000, 500_000_000], label="$100K/DALY", ls="--")
+plt.plot([-2_000, 5_000], [-300_000_000, 750_000_000], label="$150K/DALY", ls="--")
+for sp in ["top", "right"]:
+    ax.spines[sp].set_visible(False)
+ax.spines["left"].set_position(("data", 0))
+ax.spines["bottom"].set_position(("data", 0))
+plt.grid(alpha=.2)
+plt.gca().yaxis.set_major_formatter(ticker.FuncFormatter(millions_formatter))
+plt.gca().xaxis.set_major_formatter(StrMethodFormatter("{x:,.0f}"))
+
+# Convert dataframe columns into NumPy arrays for ellipse drawing
+x = df_inc["disc_dalys"]
+y = -df_inc["soc_costs"]
+
+ci_ellipse(x, y)
+
+plt.ylabel(r'$\Delta$ Cost')  # Using the raw string literal r'' and LaTeX syntax for delta
+plt.xlabel(r'$\Delta$ DALYs')
+plt.suptitle("CEA Expanded Syphilis Screening")
+plt.title("Societal perspective")
+
+plt.legend(title="CEA Threshold", loc="center right")
+ax.text(.5, -.15, f"Baseline screening: {screen_baseline * 100:.0f}%. \nTarget screening: {screen_enhanced * 100:.0f}%",
+        ha="center", transform=ax.transAxes,
+        fontdict={'style':'italic'})
+plt.show();
+```
+
+
+    
+![png](output_53_0.png)
+    
+
+
+
+```python
+fig, ax = plt.subplots(figsize=(8,5))
+plt.scatter(df_inc["disc_dalys"], -df_inc["hs_costs"], s=1, color="g")
+plt.plot([-2_000, 5_000], [-100_000_000, 250_000_000], ls="--", label="$50K/DALY")
+plt.plot([-2_000, 5_000], [-200_000_000, 500_000_000], ls="--", label="$100K/DALY")
+plt.plot([-2_000, 5_000], [-300_000_000, 750_000_000], ls="--", label="150K/DALY")
+
+plt.grid(alpha=.2)
+for sp in ["top", "right"]:
+    ax.spines[sp].set_visible(False)
+
+ax.spines["left"].set_position(("data", 0))
+ax.spines["bottom"].set_position(("data", 0))
+
+ci_ellipse(df_inc["disc_dalys"], -df_inc["hs_costs"])
+plt.gca().xaxis.set_major_formatter(StrMethodFormatter("{x:,.0f}"))
+plt.gca().yaxis.set_major_formatter(ticker.FuncFormatter(millions_formatter))
+
+plt.ylabel(r'$\Delta$ Cost')  # Using the raw string literal r'' and LaTeX syntax for delta
+plt.xlabel(r'$\Delta$ DALYs')
+plt.suptitle("CEA Expanded Syphilis Screening")
+plt.title("Health sector perspective")
+
+plt.legend(title="CEA Threshold", loc="upper right")
+ax.text(.5, -.15, f"Baseline screening: {screen_baseline * 100:.0f}%. \nTarget screening: {screen_enhanced * 100:.0f}%",
+        ha="center", transform=ax.transAxes,
+        fontdict={'style':'italic'})
+plt.show();
+```
+
+
+    
+![png](output_54_0.png)
+    
+
+
+
+```python
+df_inc["hs_costs"].mean() - program_costs
+```
+
+
+
+
+    np.float64(-171054261.40881467)
+
+
+
+
+```python
+thresholds = list(range(1_000, 200_000, 1_000))
+probs = []
+for threshold in thresholds:
+    proportions = ((df_inc["hs_costs"] / df_inc["disc_dalys"]) < threshold).mean()
+    probs.append(proportions)
+
+```
+
+
+```python
+fig, ax = plt.subplots(figsize=(8,5))
+plt.plot(thresholds, probs, color="k", label="CEAC")
+plt.grid(alpha=.2)
+plt.gca().xaxis.set_major_formatter(ticker.FuncFormatter(dollar_formatter))
+plt.title("Cost Effectiveness Acceptability Expanded Syphilis Treatment \nHealth System Perspective")
+plt.legend(loc="lower right")
+for sp in ["top", "right"]:
+    ax.spines[sp].set_visible(False)
+plt.ylabel("Probability cost effective")
+plt.xlabel("Threshold per DALY")
+```
+
+
+
+
+    Text(0.5, 0, 'Threshold per DALY')
+
+
+
+
+    
+![png](output_57_1.png)
+    
+
+
+#### Univariate sensitivity analysis
+- Provide Tornado diagram
+- Vary screening and treatment costs
+- Vary VSL and human capital costs for societal perspective
+- For DALYs - use 2.5 and 97.5 percentiles
+- Change baseline incidence
+
+
+```python
+# DALYs averted sensitivity analysis (HS perspective)
+univ_daly_min = df_inc["hs_costs"].mean()/df_inc["disc_dalys"].quantile(.975)
+univ_daly_max = df_inc["hs_costs"].mean()/df_inc["disc_dalys"].quantile(.025)
+print(f"One way sensitivity analyses varying DALYs: $[{univ_daly_min:,.2f}, {univ_daly_max:,.2f}]")
+```
+
+    One way sensitivity analyses varying DALYs: $[3,079.00, 4,186.37]
+    
+
+
+```python
+df_inc["hs_costs"].max()/df_inc["disc_dalys"].min()
+```
+
+
+
+
+    np.float64(10498.160682420857)
+
+
+
+#### Additional results
+- Cost per case of congenital syphilis prevented
+- Cost per IUFD, SB, NND averted
+- Net monetary benefit
+- Simulations by coverage proportion
+
+
+
+
+```python
+
+```
