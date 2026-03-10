@@ -1,0 +1,639 @@
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+import matplotlib.pyplot as plt
+from matplotlib.patches import Ellipse
+from matplotlib.ticker import StrMethodFormatter
+import matplotlib.ticker as ticker
+
+from scipy.stats import beta as beta_dist
+from scipy.stats import lognorm, gamma, uniform
+
+
+# -----------------------------
+# Formatting helpers
+# -----------------------------
+def dollar_formatter(x, pos):
+    return f"${x:,.0f}"
+
+def millions_formatter(x, pos):
+    return f"${x*1e-6:,.0f}M"
+
+
+# -----------------------------
+# Ellipse helper (95% CI ellipse)
+# -----------------------------
+def ci_ellipse(x, y, edgecolor="k"):
+    mean = np.array([np.mean(x), np.mean(y)])
+    cov = np.cov(x, y)
+
+    eigenvalues, eigenvectors = np.linalg.eig(cov)
+    angle = np.arctan2(eigenvectors[1, 0], eigenvectors[0, 0])
+
+    width = 2 * np.sqrt(eigenvalues[0]) * np.sqrt(5.991)
+    height = 2 * np.sqrt(eigenvalues[1]) * np.sqrt(5.991)
+
+    ellipse = Ellipse(
+        xy=mean,
+        width=width,
+        height=height,
+        angle=np.rad2deg(angle),
+        edgecolor=edgecolor,
+        fc="None",
+        lw=1,
+    )
+    plt.gca().add_patch(ellipse)
+    return ellipse
+
+
+# -----------------------------
+# Distribution helpers (from your notebook, lightly hardened)
+# -----------------------------
+def std_2(lower_ci, upper_ci):
+    return (upper_ci - lower_ci) / 4.0
+
+def ln_params_from_ci(m, lo, hi):
+    lo = max(lo, 1e-12)
+    hi = max(hi, lo * 1.01)
+    m = max(m, 1e-12)
+    mu = np.log(m)
+    sigma = (np.log(hi) - np.log(lo)) / (2 * 1.96)
+    sigma = max(sigma, 1e-12)
+    return mu, sigma
+
+def sample_lognormal_from_bounds(lower, upper, size=1, rng=None):
+    rng = rng or np.random.default_rng()
+    lower = max(lower, 1e-12)
+    upper = max(upper, lower * 1.01)
+    mu, sigma = ln_params_from_ci(np.sqrt(lower * upper), lower, upper)
+    return lognorm(s=sigma, scale=np.exp(mu)).rvs(size=size, random_state=rng)
+
+def beta_from_mean(m, n=1000, size=1, rng=None):
+    rng = rng or np.random.default_rng()
+    m = float(np.clip(m, 1e-9, 1 - 1e-9))
+    a = m * n
+    b = (1 - m) * n
+    return beta_dist(a, b).rvs(size=size, random_state=rng)
+
+def beta_params_from_bounds(mean, low, high):
+    # moment-based approximation from your notebook
+    mean = float(np.clip(mean, 1e-9, 1 - 1e-9))
+    low = float(np.clip(low, 1e-9, 1 - 1e-9))
+    high = float(np.clip(high, 1e-9, 1 - 1e-9))
+    sd_approx = (high - low) / 4.0
+    var = max(sd_approx ** 2, 1e-12)
+    denom = mean * (1 - mean)
+    if denom <= 0 or var <= 0:
+        return 1.0, 1.0
+    ab = max(denom / var - 1.0, 1e-6)
+    a = max(mean * ab, 1e-6)
+    b = max((1 - mean) * ab, 1e-6)
+    return a, b
+
+def gamma_params_from_mean_sd(mean, sd):
+    mean = max(float(mean), 1e-12)
+    sd = max(float(sd), 1e-12)
+    shape = (mean / sd) ** 2
+    scale = (sd ** 2) / mean
+    return shape, scale
+
+
+# -----------------------------
+# Default core inputs (lifted from your code)
+# You can keep these in app.py or split into a config.py
+# -----------------------------
+BASELINE_BETA = {
+    "preterm": {"alpha": 1040, "beta": 8960},
+    "lbw": {"alpha": 850, "beta": 9150},
+    "stillbirth": {"alpha": 55, "beta": 9945},
+    "neonatal_death": {"alpha": 36, "beta": 9964},
+    "miscarriage": {"alpha": 1500, "beta": 8500},
+}
+
+UNTREATED_ABS = {
+    "preterm": 0.232,
+    "lbw": 0.234,
+    "stillbirth": 0.264,
+    "miscarriage": 0.149,
+    "neonatal_death": 0.162,
+    "cs_any": 0.360,
+}
+
+TX_RR_PARAMS = {
+    "preterm": {"rr": 0.48, "lo": 0.39, "hi": 0.58},
+    "lbw": {"rr": 0.50, "lo": 0.42, "hi": 0.59},
+    "stillbirth": {"rr": 0.21, "lo": 0.10, "hi": 0.35},
+    "neonatal_death": {"rr": 0.20, "lo": 0.13, "hi": 0.32},
+    "cs_any": {"rr": 0.03, "lo": 0.02, "hi": 0.07},
+}
+
+# Cost means/sds (from your CostInputs simulation section; pared to what’s needed for plots)
+COST_INPUTS = {
+    "iufd_cost_mean": 13_049.29,
+    "iufd_cost_sd": std_2(10_741.88, 20_141.02),
+    "nnd_cost_mean": 189_784.19,
+    "nnd_cost_sd": std_2(147_700.80, 268_546.91),
+    "stillborn_cost_mean": 141_792.46,
+    "stillborn_cost_sd": std_2(120_846.11, 201_410.18),
+    "lbw_hs_cost_mean": 64_086,
+    "lbw_hs_cost_sd": std_2(60_205, 67_891),
+    "cs_hs_cost_mean": 42_767.72,
+    "cs_hs_cost_sd": std_2(27_087.95, 66_247.52),
+}
+
+# Valuation constants (you had these later)
+DEFAULT_VSL_DHHS = 13_700_000
+DEFAULT_HC_VALUE = 1_921_000
+
+
+# -----------------------------
+# Core simulation functions (vectorized MC like your notebook)
+# -----------------------------
+def draw_baseline_risks(N, rng):
+    def draw(par):
+        return beta_dist(par["alpha"], par["beta"]).rvs(size=N, random_state=rng)
+
+    return {
+        "preterm": draw(BASELINE_BETA["preterm"]),
+        "lbw": draw(BASELINE_BETA["lbw"]),
+        "stillbirth": draw(BASELINE_BETA["stillbirth"]),
+        "neonatal_death": draw(BASELINE_BETA["neonatal_death"]),
+        "miscarriage": draw(BASELINE_BETA["miscarriage"]),
+    }
+
+def draw_rrs(N, rng):
+    rrs = {}
+    for key, p in TX_RR_PARAMS.items():
+        mu, sigma = ln_params_from_ci(p["rr"], p["lo"], p["hi"])
+        rrs[key] = lognorm(s=sigma, scale=np.exp(mu)).rvs(size=N, random_state=rng)
+    return rrs
+
+def draw_untreated_abs(N, rng):
+    # Your helper used beta_from_mean(untreated_abs, n=1000)
+    return {k: beta_from_mean(v, n=1000, size=N, rng=rng) for k, v in UNTREATED_ABS.items()}
+
+def strategy_outcomes(
+    *,
+    COHORT,
+    N,
+    p_active_syph,
+    screen_cov,
+    sens_serology,
+    adequate_tx_given_positive,
+    timely_treatment_fraction,
+    prop_cs_symptomatic,
+    prop_late_fetal,
+    baseline_risks,
+    untreated_abs,
+    rrs,
+):
+    # Detection and adequacy
+    p_detect = screen_cov * sens_serology
+    p_adequate = p_detect * adequate_tx_given_positive * timely_treatment_fraction
+
+    # Syphilis risks under strategy (treated vs not) - vectorized
+    preterm_syph = p_adequate * (untreated_abs["preterm"] * rrs["preterm"]) + (1 - p_adequate) * untreated_abs["preterm"]
+    lbw_syph     = p_adequate * (untreated_abs["lbw"] * rrs["lbw"])         + (1 - p_adequate) * untreated_abs["lbw"]
+    still_syph   = p_adequate * (untreated_abs["stillbirth"] * rrs["stillbirth"]) + (1 - p_adequate) * untreated_abs["stillbirth"]
+    neo_syph     = p_adequate * (untreated_abs["neonatal_death"] * rrs["neonatal_death"]) + (1 - p_adequate) * untreated_abs["neonatal_death"]
+
+    # You kept miscarriage untreated regardless of treatment (kept same here)
+    mis_syph     = untreated_abs["miscarriage"]
+
+    cs_any_syph  = p_adequate * (untreated_abs["cs_any"] * rrs["cs_any"]) + (1 - p_adequate) * untreated_abs["cs_any"]
+    cs_comp_syph = cs_any_syph * prop_cs_symptomatic
+    cs_uncomp_syph = cs_any_syph * (1 - prop_cs_symptomatic)
+
+    p = p_active_syph
+
+    preterm = p * preterm_syph + (1 - p) * baseline_risks["preterm"]
+    lbw     = p * lbw_syph     + (1 - p) * baseline_risks["lbw"]
+    still   = p * still_syph   + (1 - p) * baseline_risks["stillbirth"]
+    neo     = p * neo_syph     + (1 - p) * baseline_risks["neonatal_death"]
+    mis     = p * mis_syph     + (1 - p) * baseline_risks["miscarriage"]
+
+    iufd = still * prop_late_fetal
+
+    cs_comp = p * cs_comp_syph
+    cs_uncomp = p * cs_uncomp_syph
+
+    def to_counts(x):
+        return np.round(x * COHORT).astype(int)
+
+    return {
+        "Preterm births": to_counts(preterm),
+        "Low birth weight": to_counts(lbw),
+        "Stillbirths (≥20w)": to_counts(still),
+        "IUFD (≥28w subset)": to_counts(iufd),
+        "Miscarriages (<20w clinical)": to_counts(mis),
+        "Neonatal deaths (<28d)": to_counts(neo),
+        "Congenital syphilis – complicated": to_counts(cs_comp),
+        "Congenital syphilis – uncomplicated": to_counts(cs_uncomp),
+    }
+
+def diff_dict(d_base, d_target):
+    keys = list(d_base.keys())
+    return {f"Δ {k} (prevented)": (np.asarray(d_base[k]) - np.asarray(d_target[k])) for k in keys}
+
+
+def draw_cost_samples(N, rng, cost_inputs):
+    # gamma from mean/sd for costs you used in the later section
+    samples = {}
+    for k, mean in cost_inputs.items():
+        if not k.endswith("_mean"):
+            continue
+        sd_key = k.replace("_mean", "_sd")
+        sd = cost_inputs.get(sd_key, None)
+        if sd is None:
+            continue
+        shape, scale = gamma_params_from_mean_sd(mean, sd)
+        samples[k.replace("_mean", "")] = gamma.rvs(a=shape, scale=scale, size=N, random_state=rng)
+    return samples
+
+
+def compute_costs_and_dalys(
+    df_inc,
+    cost_samples,
+    vsl_value,
+    hc_value,
+    program_cost_per_person,
+    COHORT,
+):
+    """
+    Minimal implementation to reproduce your CEA planes:
+    - HS costs: IUFD + NND + SB + LBW + CS (HS only) - program_costs
+    - Societal (VSL) costs: add VSL for IUFD/NND/SB + CS HS (or could use your broader societal module later)
+    - DALYs: for now, use your 'disc_dalys' placeholder-like structure:
+      We’ll keep it simple: DALYs = neonatal deaths prevented * discounted LE proxy
+      BUT your notebook has a more elaborate DALY build. Here we keep the plumbing,
+      and you can swap in the full DALY logic.
+    """
+    # Program costs
+    program_costs = COHORT * program_cost_per_person
+
+    # Pull deltas
+    d_iufd = df_inc["Δ IUFD (≥28w subset) (prevented)"].to_numpy()
+    d_nnd  = df_inc["Δ Neonatal deaths (<28d) (prevented)"].to_numpy()
+    d_sb   = df_inc["Δ Stillbirths (≥20w) (prevented)"].to_numpy()
+    d_lbw  = df_inc["Δ Low birth weight (prevented)"].to_numpy()
+    d_cs_c = df_inc["Δ Congenital syphilis – complicated (prevented)"].to_numpy()
+    d_cs_u = df_inc["Δ Congenital syphilis – uncomplicated (prevented)"].to_numpy()
+
+    # HS costs (gamma samples)
+    iufd_hs = d_iufd * cost_samples["iufd_cost"]
+    nnd_hs  = d_nnd  * cost_samples["nnd_cost"]
+    sb_hs   = d_sb   * cost_samples["stillborn_cost"]
+    lbw_hs  = d_lbw  * cost_samples["lbw_hs_cost"]
+    cs_hs   = (d_cs_c + d_cs_u) * cost_samples["cs_hs_cost"]
+
+    hs_costs = iufd_hs + nnd_hs + sb_hs + lbw_hs + cs_hs - program_costs
+
+    # Societal (VSL + HS)
+    soc_costs = (
+        hs_costs
+        + d_iufd * vsl_value
+        + d_nnd * vsl_value
+        + d_sb * vsl_value
+    )
+
+    # Very simple DALYs proxy to keep the app stable by default:
+    # Use discounted life expectancy proxy (you had ~27.55 discounted yrs at 3.5% for LE=78)
+    discounted_le_proxy = 27.55
+    dalys = d_nnd * discounted_le_proxy
+
+    out = df_inc.copy()
+    out["hs_costs"] = hs_costs
+    out["soc_costs"] = soc_costs
+    out["disc_dalys"] = dalys
+
+    return out
+
+
+@st.cache_data(show_spinner=False)
+def run_model_cached(
+    *,
+    COHORT: int,
+    N: int,
+    seed: int,
+    p_active_syph: float,
+    screen_baseline: float,
+    screen_target: float,
+    sens_serology: float,
+    adequate_tx_given_positive: float,
+    timely_treatment_fraction: float,
+    prop_cs_symptomatic: float,
+    prop_late_fetal: float,
+    program_cost_per_person: float,
+    vsl_value: float,
+    hc_value: float,
+):
+    rng = np.random.default_rng(seed)
+
+    baseline_risks = draw_baseline_risks(N, rng)
+    untreated_abs = draw_untreated_abs(N, rng)
+    rrs = draw_rrs(N, rng)
+    cost_samples = draw_cost_samples(N, rng, COST_INPUTS)
+
+    out_base = strategy_outcomes(
+        COHORT=COHORT, N=N,
+        p_active_syph=p_active_syph,
+        screen_cov=screen_baseline,
+        sens_serology=sens_serology,
+        adequate_tx_given_positive=adequate_tx_given_positive,
+        timely_treatment_fraction=timely_treatment_fraction,
+        prop_cs_symptomatic=prop_cs_symptomatic,
+        prop_late_fetal=prop_late_fetal,
+        baseline_risks=baseline_risks,
+        untreated_abs=untreated_abs,
+        rrs=rrs,
+    )
+    out_tgt = strategy_outcomes(
+        COHORT=COHORT, N=N,
+        p_active_syph=p_active_syph,
+        screen_cov=screen_target,
+        sens_serology=sens_serology,
+        adequate_tx_given_positive=adequate_tx_given_positive,
+        timely_treatment_fraction=timely_treatment_fraction,
+        prop_cs_symptomatic=prop_cs_symptomatic,
+        prop_late_fetal=prop_late_fetal,
+        baseline_risks=baseline_risks,
+        untreated_abs=untreated_abs,
+        rrs=rrs,
+    )
+
+    delta = diff_dict(out_base, out_tgt)
+    df_inc = pd.DataFrame(delta)
+    df_inc["iteration"] = np.arange(N)
+
+    df_inc2 = compute_costs_and_dalys(
+        df_inc=df_inc,
+        cost_samples=cost_samples,
+        vsl_value=vsl_value,
+        hc_value=hc_value,
+        program_cost_per_person=program_cost_per_person,
+        COHORT=COHORT,
+    )
+
+    # Summaries for outputs prevented
+    prevented_cols = [c for c in df_inc2.columns if c.startswith("Δ ")]
+    summary_prevented = df_inc2[prevented_cols].agg(["mean", "median", "quantile"])
+    # quantile gives a Series of objects; do clean summary instead:
+    summ = []
+    for col in prevented_cols + ["disc_dalys", "hs_costs", "soc_costs"]:
+        arr = df_inc2[col].to_numpy()
+        summ.append({
+            "metric": col,
+            "mean": float(np.mean(arr)),
+            "median": float(np.median(arr)),
+            "p2.5": float(np.percentile(arr, 2.5)),
+            "p97.5": float(np.percentile(arr, 97.5)),
+        })
+    summary = pd.DataFrame(summ)
+
+    return df_inc2, summary
+
+
+# -----------------------------
+# Streamlit UI
+# -----------------------------
+st.set_page_config(page_title="Syphilis Screening CEA Sandbox", layout="wide")
+
+st.title("Expanded Syphilis Prenatal Screening & Treatment — CEA Sandbox")
+st.caption("Interactive Monte Carlo model with calibration sliders. Use the Assumptions tab to review core inputs.")
+
+with st.sidebar:
+    st.header("Calibration sliders")
+
+    COHORT = st.number_input("Cohort size (pregnancies)", min_value=1_000, max_value=5_000_000, value=100_000, step=10_000)
+    N = st.number_input("Monte Carlo iterations", min_value=500, max_value=200_000, value=10_000, step=500)
+    seed = st.number_input("Random seed", min_value=1, max_value=1_000_000, value=2025, step=1)
+
+    st.subheader("Epidemiology")
+    p_active_syph = st.slider("Active maternal syphilis prevalence", 0.0, 0.10, 0.01, 0.001, format="%.3f")
+
+    st.subheader("Screening strategy")
+    screen_baseline = st.slider("Baseline screening coverage", 0.0, 1.0, 0.40, 0.01)
+    screen_target = st.slider("Target screening coverage", 0.0, 1.0, 0.90, 0.01)
+    sens_serology = st.slider("Serology sensitivity", 0.50, 1.00, 0.98, 0.01)
+
+    st.subheader("Treatment cascade")
+    adequate_tx_given_positive = st.slider("Adequate treatment given positive", 0.0, 1.0, 0.85, 0.01)
+    timely_treatment_fraction = st.slider("Timely treatment fraction", 0.0, 1.0, 0.85, 0.01)
+
+    st.subheader("Clinical structure")
+    prop_cs_symptomatic = st.slider("Proportion CS symptomatic/complicated", 0.0, 1.0, 0.38, 0.01)
+    prop_late_fetal = st.slider("Proportion stillbirths that are IUFD ≥28w", 0.0, 1.0, 0.49, 0.01)
+
+    st.subheader("Costs (for planes/CEAC)")
+    program_cost_per_person = st.number_input("Program cost per pregnancy (screen+tx)", min_value=0.0, max_value=10_000.0, value=100.0, step=10.0)
+
+    st.subheader("Societal valuation")
+    vsl_value = st.number_input("VSL value", min_value=0.0, max_value=50_000_000.0, value=float(DEFAULT_VSL_DHHS), step=100_000.0)
+    hc_value = st.number_input("Human capital value", min_value=0.0, max_value=10_000_000.0, value=float(DEFAULT_HC_VALUE), step=50_000.0)
+
+    st.divider()
+    st.info("Tip: If the app feels slow, reduce iterations. Caching avoids redoing unchanged runs.")
+
+
+tabs = st.tabs(["Results", "CEA plots", "Assumptions"])
+
+with st.spinner("Running simulation..."):
+    df_inc2, summary = run_model_cached(
+        COHORT=int(COHORT),
+        N=int(N),
+        seed=int(seed),
+        p_active_syph=float(p_active_syph),
+        screen_baseline=float(screen_baseline),
+        screen_target=float(screen_target),
+        sens_serology=float(sens_serology),
+        adequate_tx_given_positive=float(adequate_tx_given_positive),
+        timely_treatment_fraction=float(timely_treatment_fraction),
+        prop_cs_symptomatic=float(prop_cs_symptomatic),
+        prop_late_fetal=float(prop_late_fetal),
+        program_cost_per_person=float(program_cost_per_person),
+        vsl_value=float(vsl_value),
+        hc_value=float(hc_value),
+    )
+
+# -----------------------------
+# Tab: Results
+# -----------------------------
+with tabs[0]:
+    st.subheader("Summary (mean, median, 95% UI)")
+    st.dataframe(summary, use_container_width=True)
+
+    st.subheader("Iteration-level outputs")
+    st.dataframe(df_inc2.head(50), use_container_width=True)
+
+    csv = df_inc2.to_csv(index=False).encode("utf-8")
+    st.download_button("Download iteration-level results (CSV)", data=csv, file_name="syphilis_cea_iterations.csv", mime="text/csv")
+
+    csv2 = summary.to_csv(index=False).encode("utf-8")
+    st.download_button("Download summary (CSV)", data=csv2, file_name="syphilis_cea_summary.csv", mime="text/csv")
+
+
+# -----------------------------
+# Tab: CEA plots
+# -----------------------------
+with tabs[1]:
+    left, right = st.columns(2)
+
+    # Health sector plane
+    with left:
+        st.subheader("Cost-effectiveness plane — Health sector")
+        fig, ax = plt.subplots(figsize=(8, 5))
+        x = df_inc2["disc_dalys"].to_numpy()
+        y = -df_inc2["hs_costs"].to_numpy()
+
+        ax.scatter(x, y, s=2)
+        ax.plot([-2_000, 5_000], [-100_000_000, 250_000_000], ls="--", label="$50K/DALY")
+        ax.plot([-2_000, 5_000], [-200_000_000, 500_000_000], ls="--", label="$100K/DALY")
+        ax.plot([-2_000, 5_000], [-300_000_000, 750_000_000], ls="--", label="$150K/DALY")
+
+        for sp in ["top", "right"]:
+            ax.spines[sp].set_visible(False)
+        ax.spines["left"].set_position(("data", 0))
+        ax.spines["bottom"].set_position(("data", 0))
+        ax.grid(alpha=0.2)
+
+        ax.xaxis.set_major_formatter(StrMethodFormatter("{x:,.0f}"))
+        ax.yaxis.set_major_formatter(ticker.FuncFormatter(millions_formatter))
+
+        ci_ellipse(x, y)
+        ax.set_xlabel(r"$\Delta$ DALYs (proxy)")
+        ax.set_ylabel(r"$\Delta$ Cost")
+        ax.set_title("Health sector perspective")
+        ax.legend(loc="upper right")
+        ax.text(
+            0.5, -0.18,
+            f"Baseline screening: {screen_baseline*100:.0f}%  |  Target: {screen_target*100:.0f}%",
+            ha="center", transform=ax.transAxes, style="italic"
+        )
+
+        st.pyplot(fig, clear_figure=True)
+
+    # Societal (VSL) plane
+    with right:
+        st.subheader("Cost-effectiveness plane — Societal (VSL + HS)")
+        fig, ax = plt.subplots(figsize=(8, 5))
+        x = df_inc2["disc_dalys"].to_numpy()
+        y = -df_inc2["soc_costs"].to_numpy()
+
+        ax.scatter(x, y, s=2)
+        ax.plot([-2_000, 5_000], [-100_000_000, 250_000_000], ls="--", label="$50K/DALY")
+        ax.plot([-2_000, 5_000], [-200_000_000, 500_000_000], ls="--", label="$100K/DALY")
+        ax.plot([-2_000, 5_000], [-300_000_000, 750_000_000], ls="--", label="$150K/DALY")
+
+        for sp in ["top", "right"]:
+            ax.spines[sp].set_visible(False)
+        ax.spines["left"].set_position(("data", 0))
+        ax.spines["bottom"].set_position(("data", 0))
+        ax.grid(alpha=0.2)
+
+        ax.xaxis.set_major_formatter(StrMethodFormatter("{x:,.0f}"))
+        ax.yaxis.set_major_formatter(ticker.FuncFormatter(millions_formatter))
+
+        ci_ellipse(x, y)
+        ax.set_xlabel(r"$\Delta$ DALYs (proxy)")
+        ax.set_ylabel(r"$\Delta$ Cost")
+        ax.set_title("Societal perspective (VSL + HS)")
+        ax.legend(loc="upper right")
+        ax.text(
+            0.5, -0.18,
+            f"Baseline screening: {screen_baseline*100:.0f}%  |  Target: {screen_target*100:.0f}%",
+            ha="center", transform=ax.transAxes, style="italic"
+        )
+
+        st.pyplot(fig, clear_figure=True)
+
+    st.divider()
+    st.subheader("CEAC (Health sector)")
+
+    thresholds = np.arange(1_000, 200_000 + 1_000, 1_000)
+    icers = df_inc2["hs_costs"] / np.maximum(df_inc2["disc_dalys"], 1e-9)
+    probs = [(icers < t).mean() for t in thresholds]
+
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    ax.plot(thresholds, probs, color="black", label="CEAC")
+    ax.grid(alpha=0.2)
+    ax.xaxis.set_major_formatter(ticker.FuncFormatter(dollar_formatter))
+    for sp in ["top", "right"]:
+        ax.spines[sp].set_visible(False)
+    ax.set_ylim(0, 1)
+    ax.set_ylabel("Probability cost-effective")
+    ax.set_xlabel("Threshold ($/DALY)")
+    ax.legend(loc="lower right")
+    st.pyplot(fig, clear_figure=True)
+
+    st.caption(
+        "Note: DALYs here are a simplified proxy to keep the shared app responsive. "
+        "You can swap `compute_costs_and_dalys()` to your full DALY module."
+    )
+
+
+# -----------------------------
+# Tab: Assumptions
+# -----------------------------
+with tabs[2]:
+    st.subheader("Core assumptions (editable in sidebar)")
+    core = pd.DataFrame([
+        {"Parameter": "Cohort size", "Value": int(COHORT)},
+        {"Parameter": "MC iterations", "Value": int(N)},
+        {"Parameter": "Seed", "Value": int(seed)},
+        {"Parameter": "Active maternal syphilis prevalence", "Value": float(p_active_syph)},
+        {"Parameter": "Baseline screening coverage", "Value": float(screen_baseline)},
+        {"Parameter": "Target screening coverage", "Value": float(screen_target)},
+        {"Parameter": "Serology sensitivity", "Value": float(sens_serology)},
+        {"Parameter": "Adequate tx given positive", "Value": float(adequate_tx_given_positive)},
+        {"Parameter": "Timely tx fraction", "Value": float(timely_treatment_fraction)},
+        {"Parameter": "Prop CS symptomatic/complicated", "Value": float(prop_cs_symptomatic)},
+        {"Parameter": "Prop stillbirths that are IUFD ≥28w", "Value": float(prop_late_fetal)},
+        {"Parameter": "Program cost per pregnancy", "Value": float(program_cost_per_person)},
+        {"Parameter": "VSL", "Value": float(vsl_value)},
+        {"Parameter": "Human capital value", "Value": float(hc_value)},
+    ])
+    st.dataframe(core, use_container_width=True)
+
+    st.subheader("Baseline risks (Beta priors)")
+    st.dataframe(pd.DataFrame(BASELINE_BETA).T, use_container_width=True)
+
+    st.subheader("Untreated syphilis absolute risks (used as means for Beta draws)")
+    st.dataframe(pd.DataFrame({"risk": UNTREATED_ABS}), use_container_width=True)
+
+    st.subheader("Treatment relative risk parameters (lognormal draws)")
+    st.dataframe(pd.DataFrame(TX_RR_PARAMS).T, use_container_width=True)
+
+    st.subheader("Costs used for plots (Gamma draws)")
+    cost_table = []
+    for k, v in COST_INPUTS.items():
+        if k.endswith("_mean"):
+            base = k.replace("_mean", "")
+            cost_table.append({
+                "cost_component": base,
+                "mean": COST_INPUTS[f"{base}_mean"],
+                "sd": COST_INPUTS[f"{base}_sd"],
+            })
+    st.dataframe(pd.DataFrame(cost_table), use_container_width=True)
+
+    st.subheader("Citations / sources (as provided)")
+    st.markdown(
+        """
+- Ignored and undervalued in public health: health state utility values for syphilis  
+  https://pmc.ncbi.nlm.nih.gov/articles/PMC10863090/
+
+- Stillbirths: Economic and psychosocial consequences (Lancet)  
+  https://www.thelancet.com/journals/lancet/article/PIIS0140-6736(15)00836-3/fulltext
+
+- Estimates of lifetime productivity costs (STIs incl. syphilis)  
+  https://pmc.ncbi.nlm.nih.gov/articles/PMC11392646/
+
+- Estimated lifetime medical cost of syphilis in the U.S.  
+  https://pmc.ncbi.nlm.nih.gov/articles/PMC10028531/
+"""
+    )
+
+    st.caption(
+        "If you want this Assumptions tab to include exact page/table references, "
+        "I can add a structured citation table once you provide the specific extracted values you want locked in."
+    )
