@@ -1,0 +1,757 @@
+import warnings
+from dataclasses import dataclass, asdict
+from typing import Dict, Tuple, Optional
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+from scipy.stats import beta, lognorm, gamma, uniform
+
+import matplotlib.pyplot as plt
+from matplotlib.patches import Ellipse
+import matplotlib.ticker as ticker
+from matplotlib.ticker import StrMethodFormatter
+
+warnings.filterwarnings("ignore")
+
+# =====================================
+# Helpers
+# =====================================
+
+def dollar_formatter(x, pos):
+    return f"${x:,.0f}"
+
+
+def millions_formatter(x, pos):
+    return f"${x * 1e-6:,.0f}M"
+
+
+def ci_ellipse(x, y, edgecolor="k"):
+    """Draw a 95% confidence ellipse around x/y values on the current axes."""
+    x = np.asarray(x)
+    y = np.asarray(y)
+    if len(x) < 3:
+        return None
+
+    mean = np.array([np.mean(x), np.mean(y)])
+    cov = np.cov(x, y)
+
+    # covariance is symmetric -> eigh gives stable ordering
+    eigenvalues, eigenvectors = np.linalg.eigh(cov)
+    order = np.argsort(eigenvalues)[::-1]
+    eigenvalues = eigenvalues[order]
+    eigenvectors = eigenvectors[:, order]
+
+    angle = np.arctan2(eigenvectors[1, 0], eigenvectors[0, 0])
+
+    # chi2 quantile for 2 df at 95%
+    chi2_95 = 5.991
+    width = 2 * np.sqrt(eigenvalues[0] * chi2_95)
+    height = 2 * np.sqrt(eigenvalues[1] * chi2_95)
+
+    ell = Ellipse(
+        xy=mean,
+        width=width,
+        height=height,
+        angle=np.rad2deg(angle),
+        edgecolor=edgecolor,
+        facecolor="None",
+        lw=1,
+    )
+    plt.gca().add_patch(ell)
+    return ell
+
+
+def std_2(lower_ci, upper_ci):
+    """Approx SD from 95% interval bounds."""
+    return (upper_ci - lower_ci) / 4.0
+
+
+def pv_years(years: float, r: float) -> float:
+    if years <= 0:
+        return 0.0
+    if r == 0:
+        return float(years)
+    return float((1 - (1 + r) ** (-years)) / r)
+
+
+def pv_annuity(amount_per_year: float, years: float, r: float) -> float:
+    return amount_per_year * pv_years(years, r)
+
+
+def lognorm_params_from_bounds(lower: float, upper: float) -> Tuple[float, float]:
+    """Return mu and sigma for lognormal where lower/upper ~ 2.5% and 97.5%."""
+    lower = max(lower, 1e-12)
+    upper = max(upper, lower * 1.01)
+    sigma = (np.log(upper) - np.log(lower)) / 3.92
+    mu = (np.log(lower) + np.log(upper)) / 2.0
+    return mu, sigma
+
+
+def sample_lognormal_from_bounds(lower: float, upper: float, size: int, rs: np.random.RandomState) -> np.ndarray:
+    mu, sigma = lognorm_params_from_bounds(lower, upper)
+    return lognorm(s=sigma, scale=np.exp(mu)).rvs(size=size, random_state=rs)
+
+
+def beta_params_from_bounds(mean: float, low: float, high: float) -> Tuple[float, float]:
+    """Method-of-moments beta fit using low/high as ~95% bounds."""
+    mean = float(mean)
+    mean = min(max(mean, 1e-6), 1 - 1e-6)
+
+    sd_approx = float((high - low) / 4.0)
+    var = max(sd_approx**2, 1e-10)
+
+    denom = mean * (1 - mean)
+    ab = max(denom / var - 1.0, 1e-3)
+    a = max(mean * ab, 1e-3)
+    b = max((1 - mean) * ab, 1e-3)
+    return a, b
+
+
+def gamma_from_mean_sd(mean: float, sd: float) -> Tuple[float, float]:
+    """Return (shape, scale) for Gamma with given mean and sd."""
+    mean = float(mean)
+    sd = float(sd)
+    sd = max(sd, 1e-9)
+    shape = (mean / sd) ** 2
+    scale = (sd**2) / mean
+    return shape, scale
+
+
+def summarize(arr: np.ndarray) -> Dict[str, float]:
+    arr = np.asarray(arr)
+    return {
+        "mean": float(np.mean(arr)),
+        "median": float(np.median(arr)),
+        "2.5%": float(np.percentile(arr, 2.5)),
+        "97.5%": float(np.percentile(arr, 97.5)),
+    }
+
+
+# =====================================
+# Defaults (from your notebook)
+# =====================================
+
+DEFAULT_BASELINE_BETA = {
+    "preterm": {"alpha": 1040, "beta": 8960},
+    "lbw": {"alpha": 850, "beta": 9150},
+    "stillbirth": {"alpha": 55, "beta": 9945},
+    "neonatal_death": {"alpha": 36, "beta": 9964},
+    "miscarriage": {"alpha": 1500, "beta": 8500},
+}
+
+DEFAULT_UNTREATED_ABS = {
+    "preterm": 0.232,
+    "lbw": 0.234,
+    "stillbirth": 0.264,
+    "miscarriage": 0.149,
+    "neonatal_death": 0.162,
+    "cs_any": 0.360,
+}
+
+DEFAULT_TX_RR = {
+    "preterm": {"rr": 0.48, "lo": 0.39, "hi": 0.58},
+    "lbw": {"rr": 0.50, "lo": 0.42, "hi": 0.59},
+    "stillbirth": {"rr": 0.21, "lo": 0.10, "hi": 0.35},
+    "neonatal_death": {"rr": 0.20, "lo": 0.13, "hi": 0.32},
+    "cs_any": {"rr": 0.03, "lo": 0.02, "hi": 0.07},
+}
+
+
+@dataclass
+class CostInputs:
+    # Unit costs (mean + sd)
+    penicillin_cost: float = 20.0
+    penicillin_cost_sd: float = 4.0
+
+    rpr_cost: float = 9.82
+    rpr_cost_sd: float = std_2(6.71, 26.85)
+
+    fta_cost: float = 31.07
+    fta_cost_sd: float = std_2(20.14, 53.71)
+
+    # Outcomes (health sector)
+    iufd_cost: float = 13_049.29
+    iufd_cost_sd: float = std_2(10_741.88, 20_141.02)
+
+    stillborn_term_cost: float = 141_792.46
+    stillborn_term_cost_sd: float = std_2(120_846.11, 201_410.18)
+
+    nnd_preterm_cost: float = 189_784.19
+    nnd_preterm_cost_sd: float = std_2(147_700.80, 268_546.91)
+
+    workup_cs_cost: float = 1_643.68
+    workup_cs_cost_sd: float = std_2(939.91, 2_685.47)
+
+    # Congenital syphilis lifetime HS cost (your MC-derived mean/CI)
+    cs_lifetime_hs_cost: float = 42_767.72
+    cs_lifetime_hs_cost_sd: float = std_2(27_087.95, 66_247.52)
+
+    # Low birth weight HS cost
+    lbw_hs_costs: float = 64_086.0
+    lbw_hs_costs_sd: float = std_2(60_205.0, 67_891.0)
+
+
+# =====================================
+# Core simulation
+# =====================================
+
+
+def ln_params_from_ci(m: float, lo: float, hi: float) -> Tuple[float, float]:
+    """Lognormal params for RR given median-ish m and 95% bounds."""
+    lo = max(lo, 1e-12)
+    hi = max(hi, lo * 1.01)
+    sigma = (np.log(hi) - np.log(lo)) / (2 * 1.96)
+    mu = np.log(m)
+    return mu, sigma
+
+
+def draw_baseline_beta(alpha: float, beta_b: float, size: int, rs: np.random.RandomState) -> np.ndarray:
+    return beta(alpha, beta_b).rvs(size=size, random_state=rs)
+
+
+def beta_from_mean(mean: float, n: float, size: int, rs: np.random.RandomState) -> np.ndarray:
+    """Beta around mean with concentration n (pseudo-sample size)."""
+    mean = min(max(float(mean), 1e-6), 1 - 1e-6)
+    a = mean * n
+    b = (1 - mean) * n
+    return beta(a, b).rvs(size=size, random_state=rs)
+
+
+def simulate_strategy(
+    *,
+    screen_cov: float,
+    cohort: int,
+    p_active_syph: float,
+    sens_serology: float,
+    adequate_tx_given_positive: float,
+    timely_treatment_fraction: float,
+    prop_late_fetal: float,
+    prop_cs_symptomatic: float,
+    # pre-sampled arrays (common random numbers)
+    b_preterm: np.ndarray,
+    b_lbw: np.ndarray,
+    b_still: np.ndarray,
+    b_neo: np.ndarray,
+    b_mis: np.ndarray,
+    u_preterm: np.ndarray,
+    u_lbw: np.ndarray,
+    u_still: np.ndarray,
+    u_neo: np.ndarray,
+    u_mis: np.ndarray,
+    u_cs: np.ndarray,
+    rr_preterm: np.ndarray,
+    rr_lbw: np.ndarray,
+    rr_still: np.ndarray,
+    rr_neo: np.ndarray,
+    rr_cs: np.ndarray,
+) -> Dict[str, np.ndarray]:
+
+    p_detect = screen_cov * sens_serology
+    p_adequate = p_detect * adequate_tx_given_positive * timely_treatment_fraction
+
+    preterm_syph = p_adequate * (u_preterm * rr_preterm) + (1 - p_adequate) * u_preterm
+    lbw_syph = p_adequate * (u_lbw * rr_lbw) + (1 - p_adequate) * u_lbw
+    still_syph = p_adequate * (u_still * rr_still) + (1 - p_adequate) * u_still
+    neo_syph = p_adequate * (u_neo * rr_neo) + (1 - p_adequate) * u_neo
+    mis_syph = u_mis  # unchanged
+
+    cs_any_syph = p_adequate * (u_cs * rr_cs) + (1 - p_adequate) * u_cs
+    cs_comp_syph = cs_any_syph * prop_cs_symptomatic
+    cs_uncomp_syph = cs_any_syph * (1 - prop_cs_symptomatic)
+
+    p = p_active_syph
+
+    # mix syph vs non-syph
+    preterm = p * preterm_syph + (1 - p) * b_preterm
+    lbw = p * lbw_syph + (1 - p) * b_lbw
+    still = p * still_syph + (1 - p) * b_still
+    neo = p * neo_syph + (1 - p) * b_neo
+    mis = p * mis_syph + (1 - p) * b_mis
+
+    # IUFD is subset of stillbirth
+    iufd = still * prop_late_fetal
+
+    # CS occurs only in syph pregnancies in this model
+    cs_comp = p * cs_comp_syph
+    cs_uncomp = p * cs_uncomp_syph
+
+    def to_counts(prob_arr: np.ndarray) -> np.ndarray:
+        return np.round(prob_arr * cohort).astype(int)
+
+    return {
+        "Preterm births": to_counts(preterm),
+        "Low birth weight": to_counts(lbw),
+        "Stillbirths (≥20w)": to_counts(still),
+        "IUFD (≥28w subset)": to_counts(iufd),
+        "Miscarriages (<20w clinical)": to_counts(mis),
+        "Neonatal deaths (<28d)": to_counts(neo),
+        "Congenital syphilis – complicated": to_counts(cs_comp),
+        "Congenital syphilis – uncomplicated": to_counts(cs_uncomp),
+    }
+
+
+def run_simulation(
+    *,
+    n_iter: int,
+    seed: int,
+    cohort: int,
+    p_active_syph: float,
+    screen_baseline: float,
+    screen_enhanced: float,
+    sens_serology: float,
+    spec_serology: float,
+    adequate_tx_given_positive: float,
+    timely_treatment_fraction: float,
+    prop_late_fetal: float,
+    prop_cs_symptomatic: float,
+    untreated_abs: Dict[str, float],
+    untreated_conc: float,
+    baseline_beta: Dict[str, Dict[str, float]],
+    tx_rr: Dict[str, Dict[str, float]],
+    costs: CostInputs,
+    discount_rate: float,
+    life_expectancy: float,
+    include_lbw: bool,
+    include_maternal_burden: bool,
+    treat_false_positives: bool,
+    staff_cost_per_screen: float,
+) -> Tuple[pd.DataFrame, Dict[str, Dict[str, float]]]:
+
+    rs = np.random.RandomState(seed)
+
+    # Pre-sample baseline risks
+    b_preterm = draw_baseline_beta(baseline_beta["preterm"]["alpha"], baseline_beta["preterm"]["beta"], n_iter, rs)
+    b_lbw = draw_baseline_beta(baseline_beta["lbw"]["alpha"], baseline_beta["lbw"]["beta"], n_iter, rs)
+    b_still = draw_baseline_beta(baseline_beta["stillbirth"]["alpha"], baseline_beta["stillbirth"]["beta"], n_iter, rs)
+    b_neo = draw_baseline_beta(baseline_beta["neonatal_death"]["alpha"], baseline_beta["neonatal_death"]["beta"], n_iter, rs)
+    b_mis = draw_baseline_beta(baseline_beta["miscarriage"]["alpha"], baseline_beta["miscarriage"]["beta"], n_iter, rs)
+
+    # Untreated abs risks sampled around mean with pseudo n
+    u_preterm = beta_from_mean(untreated_abs["preterm"], untreated_conc, n_iter, rs)
+    u_lbw = beta_from_mean(untreated_abs["lbw"], untreated_conc, n_iter, rs)
+    u_still = beta_from_mean(untreated_abs["stillbirth"], untreated_conc, n_iter, rs)
+    u_neo = beta_from_mean(untreated_abs["neonatal_death"], untreated_conc, n_iter, rs)
+    u_mis = beta_from_mean(untreated_abs["miscarriage"], untreated_conc, n_iter, rs)
+    u_cs = beta_from_mean(untreated_abs["cs_any"], untreated_conc, n_iter, rs)
+
+    # Treatment RR lognormal draws
+    def draw_rr(key: str) -> np.ndarray:
+        mu, sigma = ln_params_from_ci(tx_rr[key]["rr"], tx_rr[key]["lo"], tx_rr[key]["hi"])
+        return lognorm(s=sigma, scale=np.exp(mu)).rvs(size=n_iter, random_state=rs)
+
+    rr_preterm = draw_rr("preterm")
+    rr_lbw = draw_rr("lbw")
+    rr_still = draw_rr("stillbirth")
+    rr_neo = draw_rr("neonatal_death")
+    rr_cs = draw_rr("cs_any")
+
+    out_base = simulate_strategy(
+        screen_cov=screen_baseline,
+        cohort=cohort,
+        p_active_syph=p_active_syph,
+        sens_serology=sens_serology,
+        adequate_tx_given_positive=adequate_tx_given_positive,
+        timely_treatment_fraction=timely_treatment_fraction,
+        prop_late_fetal=prop_late_fetal,
+        prop_cs_symptomatic=prop_cs_symptomatic,
+        b_preterm=b_preterm,
+        b_lbw=b_lbw,
+        b_still=b_still,
+        b_neo=b_neo,
+        b_mis=b_mis,
+        u_preterm=u_preterm,
+        u_lbw=u_lbw,
+        u_still=u_still,
+        u_neo=u_neo,
+        u_mis=u_mis,
+        u_cs=u_cs,
+        rr_preterm=rr_preterm,
+        rr_lbw=rr_lbw,
+        rr_still=rr_still,
+        rr_neo=rr_neo,
+        rr_cs=rr_cs,
+    )
+
+    out_int = simulate_strategy(
+        screen_cov=screen_enhanced,
+        cohort=cohort,
+        p_active_syph=p_active_syph,
+        sens_serology=sens_serology,
+        adequate_tx_given_positive=adequate_tx_given_positive,
+        timely_treatment_fraction=timely_treatment_fraction,
+        prop_late_fetal=prop_late_fetal,
+        prop_cs_symptomatic=prop_cs_symptomatic,
+        b_preterm=b_preterm,
+        b_lbw=b_lbw,
+        b_still=b_still,
+        b_neo=b_neo,
+        b_mis=b_mis,
+        u_preterm=u_preterm,
+        u_lbw=u_lbw,
+        u_still=u_still,
+        u_neo=u_neo,
+        u_mis=u_mis,
+        u_cs=u_cs,
+        rr_preterm=rr_preterm,
+        rr_lbw=rr_lbw,
+        rr_still=rr_still,
+        rr_neo=rr_neo,
+        rr_cs=rr_cs,
+    )
+
+    # Δ prevented = baseline - intervention
+    delta = {k: (np.asarray(out_base[k]) - np.asarray(out_int[k])) for k in out_base.keys()}
+    df = pd.DataFrame({f"Δ {k} (prevented)": v for k, v in delta.items()})
+    df["iteration"] = np.arange(n_iter)
+
+    # ---------- Costs: draw gamma samples per iteration ----------
+    cost_dict = asdict(costs)
+    cost_samples = {}
+    for k, v in cost_dict.items():
+        if k.endswith("_sd"):
+            continue
+        sd_key = f"{k}_sd"
+        if sd_key in cost_dict:
+            shape, scale = gamma_from_mean_sd(cost_dict[k], cost_dict[sd_key])
+            cost_samples[k] = gamma(a=shape, scale=scale).rvs(size=n_iter, random_state=rs)
+        else:
+            cost_samples[k] = np.full(n_iter, float(v))
+
+    # ---------- DALYs prevented (discounted) ----------
+    pv_L = pv_years(life_expectancy, discount_rate)
+    pv_1 = pv_years(1.0, discount_rate)
+
+    # YLL: stillbirth + neonatal death
+    still = df["Δ Stillbirths (≥20w) (prevented)"].values
+    neo = df["Δ Neonatal deaths (<28d) (prevented)"].values
+
+    daly_yll_still = still * pv_L
+    daly_yll_neo = neo * pv_L
+
+    # YLD: congenital syphilis acute/lt
+    cs_un = df["Δ Congenital syphilis – uncomplicated (prevented)"].values
+    cs_co = df["Δ Congenital syphilis – complicated (prevented)"].values
+
+    # DW sampling for complicated CS
+    a_cs, b_cs = beta_params_from_bounds(0.315, 0.159, 0.471)
+    dw_cs_comp = beta(a_cs, b_cs).rvs(size=n_iter, random_state=rs)
+
+    dw_cs_uncomp = 0.053
+    dur_uncomp = 0.25
+    dur_comp = 1.0
+
+    daly_yld_cs_un = cs_un * (dw_cs_uncomp * pv_years(dur_uncomp, discount_rate))
+    daly_yld_cs_comp = cs_co * (dw_cs_comp * pv_years(dur_comp, discount_rate))
+
+    # LT sequelae (scenario)
+    p_cs_lt = 0.20
+    dw_cs_lt = 0.100
+    daly_yld_cs_lt = (p_cs_lt * cs_co) * (dw_cs_lt * pv_years(70.0, discount_rate))
+
+    # Optional LBW YLD
+    if include_lbw:
+        lbw = df["Δ Low birth weight (prevented)"].values
+        dw_lbw = 0.106
+        daly_yld_lbw = lbw * (dw_lbw * pv_years(0.25, discount_rate))
+    else:
+        daly_yld_lbw = np.zeros(n_iter)
+
+    # Optional maternal grief YLD
+    if include_maternal_burden:
+        a_sb, b_sb = beta_params_from_bounds(0.74, 0.60, 0.80)
+        a_nd, b_nd = beta_params_from_bounds(0.658, 0.528, 0.768)
+        dw_mom_sb = beta(a_sb, b_sb).rvs(size=n_iter, random_state=rs)
+        dw_mom_nd = beta(a_nd, b_nd).rvs(size=n_iter, random_state=rs)
+        daly_mom = still * (dw_mom_sb * pv_1) + neo * (dw_mom_nd * pv_1)
+    else:
+        daly_mom = np.zeros(n_iter)
+
+    dalys_total = (
+        daly_yll_still
+        + daly_yll_neo
+        + daly_yld_cs_un
+        + daly_yld_cs_comp
+        + daly_yld_cs_lt
+        + daly_yld_lbw
+        + daly_mom
+    )
+
+    df["disc_dalys_prevented"] = dalys_total
+
+    # ---------- Outcome cost savings (HS) ----------
+    # IMPORTANT: IUFD is subset of stillbirth in your model; do not sum both.
+    savings_still = still * cost_samples["stillborn_term_cost"]
+    savings_neo = neo * cost_samples["nnd_preterm_cost"]
+
+    savings_cs_un = cs_un * cost_samples["workup_cs_cost"]
+    savings_cs_co = cs_co * (cost_samples["workup_cs_cost"] + cost_samples["cs_lifetime_hs_cost"])
+
+    if include_lbw:
+        lbw = df["Δ Low birth weight (prevented)"].values
+        savings_lbw = lbw * cost_samples["lbw_hs_costs"]
+    else:
+        savings_lbw = np.zeros(n_iter)
+
+    savings_total = savings_still + savings_neo + savings_cs_un + savings_cs_co + savings_lbw
+    df["hs_savings"] = savings_total
+
+    # ---------- Incremental program costs ----------
+    delta_screened = max(screen_enhanced - screen_baseline, 0.0) * cohort
+
+    # test costs: RPR for all additional screened; confirmatory FTA for positives
+    rpr = cost_samples["rpr_cost"]
+    fta = cost_samples["fta_cost"]
+    pen = cost_samples["penicillin_cost"]
+
+    p_pos = p_active_syph * sens_serology + (1 - p_active_syph) * (1 - spec_serology)
+
+    inc_test = delta_screened * rpr + (delta_screened * p_pos) * fta
+
+    tp = delta_screened * p_active_syph * sens_serology
+    fp = delta_screened * (1 - p_active_syph) * (1 - spec_serology)
+
+    if treat_false_positives:
+        n_treated = (tp + fp) * adequate_tx_given_positive
+    else:
+        n_treated = tp * adequate_tx_given_positive
+
+    inc_tx = n_treated * pen
+
+    inc_staff = delta_screened * staff_cost_per_screen
+
+    inc_program = inc_test + inc_tx + inc_staff
+    df["inc_program_cost_hs"] = inc_program
+
+    # ---------- Incremental cost and ICER ----------
+    inc_cost_hs = inc_program - savings_total
+    df["inc_cost_hs"] = inc_cost_hs
+
+    eps = 1e-12
+    df["icer_hs_per_daly"] = df["inc_cost_hs"] / np.maximum(df["disc_dalys_prevented"], eps)
+
+    # ---------- Summaries ----------
+    summary = {
+        "hs_inc_cost": summarize(df["inc_cost_hs"].values),
+        "dalys_prevented": summarize(df["disc_dalys_prevented"].values),
+        "icer_per_daly": summarize(df["icer_hs_per_daly"].replace([np.inf, -np.inf], np.nan).dropna().values),
+        "p_cost_saving": float((df["inc_cost_hs"].values < 0).mean()),
+    }
+
+    return df, summary
+
+
+# =====================================
+# Streamlit UI
+# =====================================
+
+st.set_page_config(page_title="Syphilis ED Screening CEA", layout="wide")
+
+st.title("Cost-effectiveness model: Expanded prenatal syphilis screening in ED")
+st.caption(
+    "This Streamlit app implements your Monte Carlo CEA workflow with common random numbers for baseline vs enhanced screening. "
+    "It reports health-sector ICERs ($/DALY), CE plane, and CEAC (NMB-based)."
+)
+
+# Sidebar: global knobs
+with st.sidebar:
+    st.header("Simulation")
+    n_iter = st.number_input("Monte Carlo iterations", min_value=1000, max_value=200000, value=10000, step=1000)
+    seed = st.number_input("Random seed", min_value=0, max_value=10_000_000, value=2025, step=1)
+
+    st.header("Population & screening")
+    cohort = st.number_input("Cohort size", min_value=1000, max_value=10_000_000, value=100000, step=1000)
+    p_active_syph = st.number_input("Active syphilis prevalence in ED pregnant cohort", min_value=0.0, max_value=0.5, value=0.01, step=0.001, format="%.3f")
+
+    screen_baseline = st.slider("Baseline screening coverage", 0.0, 1.0, 0.40, 0.01)
+    screen_enhanced = st.slider("Enhanced screening coverage", 0.0, 1.0, 0.90, 0.01)
+
+    sens_serology = st.slider("Serology sensitivity", 0.5, 1.0, 0.98, 0.01)
+    spec_serology = st.slider("Serology specificity", 0.5, 1.0, 0.98, 0.01)
+
+    adequate_tx_given_positive = st.slider("Adequate treatment given positive", 0.0, 1.0, 0.85, 0.01)
+    timely_treatment_fraction = st.slider("Timely treatment fraction", 0.0, 1.0, 0.85, 0.01)
+
+    st.header("Outcomes structure")
+    prop_late_fetal = st.slider("Proportion of stillbirths that are IUFD ≥28w (subset)", 0.0, 1.0, 0.49, 0.01)
+    prop_cs_symptomatic = st.slider("Proportion CS symptomatic (complicated)", 0.0, 1.0, 0.38, 0.01)
+
+    st.header("DALYs")
+    discount_rate = st.number_input("Discount rate", min_value=0.0, max_value=0.10, value=0.035, step=0.005, format="%.3f")
+    life_expectancy = st.number_input("Life expectancy at birth", min_value=40.0, max_value=100.0, value=78.0, step=1.0)
+
+    st.header("Toggles")
+    include_lbw = st.checkbox("Include LBW morbidity (YLD + HS costs)", value=True)
+    include_maternal_burden = st.checkbox("Include maternal grief YLD (1y) for stillbirth & neonatal death", value=True)
+    treat_false_positives = st.checkbox("Treat false positives (presumptive ED treatment)", value=False)
+
+    staff_cost_per_screen = st.number_input("Staff/navigation cost per additional screened", min_value=0.0, max_value=500.0, value=0.0, step=1.0)
+
+    st.header("CEAC")
+    wtp_max = st.number_input("Max WTP ($/DALY)", min_value=1000, max_value=500000, value=200000, step=1000)
+
+    run = st.button("Run simulation", type="primary")
+
+# Editable sections
+st.subheader("Model inputs")
+
+colA, colB = st.columns(2)
+
+with colA:
+    with st.expander("Baseline outcome risks (Beta priors)", expanded=False):
+        baseline_beta = {}
+        for k, ab in DEFAULT_BASELINE_BETA.items():
+            st.markdown(f"**{k}**")
+            a = st.number_input(f"{k} alpha", min_value=0.1, max_value=1e7, value=float(ab["alpha"]), step=1.0, key=f"base_{k}_a")
+            b = st.number_input(f"{k} beta", min_value=0.1, max_value=1e7, value=float(ab["beta"]), step=1.0, key=f"base_{k}_b")
+            baseline_beta[k] = {"alpha": a, "beta": b}
+
+    with st.expander("Untreated syphilis absolute risks (means)", expanded=False):
+        untreated_abs = {}
+        for k, v in DEFAULT_UNTREATED_ABS.items():
+            untreated_abs[k] = st.number_input(f"{k} mean", min_value=0.0, max_value=1.0, value=float(v), step=0.001, format="%.3f", key=f"unt_{k}")
+        untreated_conc = st.number_input(
+            "Concentration (pseudo-n) for untreated risks", min_value=10.0, max_value=10000.0, value=1000.0, step=10.0
+        )
+
+with colB:
+    with st.expander("Treatment relative risks (RR + 95% CI)", expanded=False):
+        tx_rr = {}
+        for k, d in DEFAULT_TX_RR.items():
+            st.markdown(f"**{k}**")
+            rr = st.number_input(f"{k} RR", min_value=0.0, max_value=5.0, value=float(d["rr"]), step=0.01, key=f"rr_{k}")
+            lo = st.number_input(f"{k} lo", min_value=0.0, max_value=5.0, value=float(d["lo"]), step=0.01, key=f"rr_{k}_lo")
+            hi = st.number_input(f"{k} hi", min_value=0.0, max_value=5.0, value=float(d["hi"]), step=0.01, key=f"rr_{k}_hi")
+            tx_rr[k] = {"rr": rr, "lo": lo, "hi": hi}
+
+    with st.expander("Costs (mean + SD; Gamma)", expanded=False):
+        c = CostInputs()
+        # allow editing all fields
+        new_vals = {}
+        for field, val in asdict(c).items():
+            # keep sd separate and small
+            if field.endswith("_sd"):
+                new_vals[field] = st.number_input(field, min_value=0.0, max_value=1e9, value=float(val), step=1.0)
+            else:
+                new_vals[field] = st.number_input(field, min_value=0.0, max_value=1e9, value=float(val), step=10.0)
+        costs = CostInputs(**new_vals)
+
+# Run & show outputs
+if run:
+    df, summary = run_simulation(
+        n_iter=int(n_iter),
+        seed=int(seed),
+        cohort=int(cohort),
+        p_active_syph=float(p_active_syph),
+        screen_baseline=float(screen_baseline),
+        screen_enhanced=float(screen_enhanced),
+        sens_serology=float(sens_serology),
+        spec_serology=float(spec_serology),
+        adequate_tx_given_positive=float(adequate_tx_given_positive),
+        timely_treatment_fraction=float(timely_treatment_fraction),
+        prop_late_fetal=float(prop_late_fetal),
+        prop_cs_symptomatic=float(prop_cs_symptomatic),
+        untreated_abs=untreated_abs,
+        untreated_conc=float(untreated_conc),
+        baseline_beta=baseline_beta,
+        tx_rr=tx_rr,
+        costs=costs,
+        discount_rate=float(discount_rate),
+        life_expectancy=float(life_expectancy),
+        include_lbw=bool(include_lbw),
+        include_maternal_burden=bool(include_maternal_burden),
+        treat_false_positives=bool(treat_false_positives),
+        staff_cost_per_screen=float(staff_cost_per_screen),
+    )
+
+    st.subheader("Results")
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Mean ΔCost (HS)", f"${summary['hs_inc_cost']['mean']:,.0f}")
+    with c2:
+        st.metric("Mean DALYs prevented", f"{summary['dalys_prevented']['mean']:,.0f}")
+    with c3:
+        st.metric("Mean ICER ($/DALY)", f"${summary['icer_per_daly']['mean']:,.0f}")
+    with c4:
+        st.metric("P(cost-saving)", f"{100*summary['p_cost_saving']:.1f}%")
+
+    # Outcome prevented table
+    st.markdown("### Outcomes prevented (baseline − enhanced)")
+    outcome_cols = [c for c in df.columns if c.startswith("Δ ") and c.endswith("(prevented)")]
+    rows = []
+    for col in outcome_cols:
+        summ = summarize(df[col].values)
+        rows.append({
+            "Outcome": col.replace("Δ ", "").replace(" (prevented)", ""),
+            "Mean": summ["mean"],
+            "2.5%": summ["2.5%"],
+            "97.5%": summ["97.5%"],
+        })
+    st.dataframe(pd.DataFrame(rows))
+
+    # CE plane
+    st.markdown("### Cost-effectiveness plane (health sector)")
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    x = df["disc_dalys_prevented"].values
+    y = df["inc_cost_hs"].values
+
+    ax.scatter(x, y, s=2)
+
+    # WTP lines
+    for wtp in [50_000, 100_000, 150_000]:
+        xs = np.array([x.min(), x.max()])
+        ax.plot(xs, wtp * xs, ls="--", label=f"${wtp/1000:.0f}K/DALY")
+
+    for sp in ["top", "right"]:
+        ax.spines[sp].set_visible(False)
+    ax.spines["left"].set_position(("data", 0))
+    ax.spines["bottom"].set_position(("data", 0))
+
+    ax.grid(alpha=0.2)
+    ax.xaxis.set_major_formatter(StrMethodFormatter("{x:,.0f}"))
+    ax.yaxis.set_major_formatter(ticker.FuncFormatter(millions_formatter))
+
+    ci_ellipse(x, y)
+
+    ax.set_xlabel(r"$\Delta$ DALYs prevented")
+    ax.set_ylabel(r"$\Delta$ Cost (HS)")
+    ax.set_title("CEA: Enhanced ED screening vs baseline")
+    ax.legend(title="WTP threshold", loc="upper right")
+
+    st.pyplot(fig, clear_figure=True)
+
+    # CEAC (NMB-based)
+    st.markdown("### CEAC (NMB-based)")
+    thresholds = np.arange(1_000, int(wtp_max) + 1, 1_000)
+    dalys = df["disc_dalys_prevented"].values
+    inc_cost = df["inc_cost_hs"].values
+
+    nmb = thresholds[None, :] * dalys[:, None] - inc_cost[:, None]
+    ce_prob = (nmb > 0).mean(axis=0)
+
+    fig2, ax2 = plt.subplots(figsize=(8, 4))
+    ax2.plot(thresholds, ce_prob, color="k")
+    ax2.grid(alpha=0.2)
+    for sp in ["top", "right"]:
+        ax2.spines[sp].set_visible(False)
+    ax2.set_ylim(0, 1)
+    ax2.set_xlabel("WTP ($/DALY)")
+    ax2.set_ylabel("Probability cost-effective")
+    ax2.xaxis.set_major_formatter(ticker.FuncFormatter(dollar_formatter))
+    ax2.set_title("Cost-effectiveness acceptability curve")
+    st.pyplot(fig2, clear_figure=True)
+
+    # Download CSV
+    st.subheader("Download")
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="Download simulation results as CSV",
+        data=csv_bytes,
+        file_name="syphilis_screening_cea_results.csv",
+        mime="text/csv",
+    )
+else:
+    st.info("Set inputs in the sidebar and click **Run simulation**.")
