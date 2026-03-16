@@ -773,9 +773,9 @@ def fig_tornado(params: Dict, base_icer: float):
     fig, ax = plt.subplots(figsize=(8, max(3, 0.55 * n + 1)))
     for i, (label, (lo, hi)) in enumerate(rows):
         ax.barh(i, hi - base_icer, left=base_icer, height=0.55,
-                color="#4a90d9", alpha=0.85, label="High" if i == 0 else "")
+                color="#4a90d9", edgecolor="k", alpha=0.85, label="High" if i == 0 else "")
         ax.barh(i, lo - base_icer, left=base_icer, height=0.55,
-                color="#e08050", alpha=0.85, label="Low"  if i == 0 else "")
+                color="#e08050", edgecolor="k", alpha=0.85, label="Low"  if i == 0 else "")
     ax.axvline(base_icer, color="k", lw=1.5, zorder=4)
     ax.set_yticks(range(n)); ax.set_yticklabels([r[0] for r in rows], fontsize=8)
     ax.xaxis.set_major_formatter(ticker.FuncFormatter(dollar_fmt))
@@ -1438,9 +1438,9 @@ with tabs[5]:
     | Chesson & Peterman (2023). *Estimated Lifetime Medical Cost of Syphilis in the US.* STD. | CS workup cost (cs_wu); sequelae probabilities |
     | Sheffield et al. (2002). *Maternal syphilis and vertical transmission.* | Tx RRs for CS outcomes |
     | CDC STI Surveillance Report (2023). | CS outcome distributions; prevalence anchors |
-    | Walker et al. (2011). *Congenital syphilis.* Lancet. | CS sequelae distribution for Markov |
-    | Wijesooriya et al. (2016). *Global burden of maternal and congenital syphilis.* PLOS ONE. | CS outcome severity split |
-    | Snowden et al. (2021). *Economic burden of stillbirth.* Birth. | Stillbirth cost |
+    | Walker et al. (2011). *Antibiotic treatment for newborns with congenital syphilis.* Lancet. | CS sequelae distribution for Markov |
+    | Korenromp et al. (2018). *Global burden of maternal and congenital syphilis.* PLOS ONE. | CS outcome severity split |
+    | Veettil et al. (2023). *Economic burden of stillbirth.* Birth. | Stillbirth cost |
     | WHO GBD disability weight database. | LBW, maternal grief DWs; Markov DW calibration |
     | DHHS ASPE (2023). *Revised Departmental Guidance on VSL.* | VSL = $13.7M (2023) |
     | US BLS CPI for Medical Care (2025 update). | 2019→2025 cost inflation |
